@@ -9,8 +9,9 @@
 aerial_crawler/
 ├── aerial/                # 采集端
 │   ├── config.py          # 运行配置（间隔、并发、退避、补登窗口等）
-│   ├── limiter.py         # 全站共享的最小发起间隔限流器 + 统一暂停
-│   ├── http.py            # 退避重试 / 503 统一暂停 / Range 分段的 HTTP 客户端
+│   ├── limiter.py         # 票号式限流器：按请求头实际发出时刻计时 + 统一暂停
+│   ├── request_log.py     # 逐条请求记录（发出时刻/建连/首字节/响应体耗时）
+│   ├── http.py            # 退避重试 / 503·429 统一暂停 / Range 分段的 HTTP 客户端
 │   ├── parsing.py         # 分页目录与卷宗详情 HTML 解析
 │   ├── state.py           # 工作目录状态（水位、失败队列、单实例锁、原子写）
 │   ├── manifest.py        # JSON Lines 事件清单 + 每卷当前条目原子视图
@@ -18,11 +19,32 @@ aerial_crawler/
 │   └── scanner.py         # 全量 / 增量采集调度、worker 池、补齐轮次
 ├── mocksite/              # 可回放的 HTTP 模拟站
 │   ├── scenario.py        # 固定场景与 20 倍速虚拟站点时钟
-│   └── server.py          # 分页目录 / 详情 / Range 影像 / 故障注入 / 限流
+│   └── server.py          # 分页目录 / 详情 / Range 影像 / 故障注入 / 限流 / 回放端点
 ├── tests/test_rules.py    # 规则级单元测试（unittest）
+├── replay.py              # 并发交错回放：一条命令核对发出时刻与结果（80 秒内）
 ├── verify.py              # 一条命令的端到端验证（80 秒内出可读报告）
 └── README.md
 ```
+
+## 并发与限流口径（重要）
+
+- **最小间隔按“请求头实际发出时刻”计算**。每次请求（含每次重试）都走
+  `reserve() → connect() → wait_turn() → 发请求头` 的票号流程：
+  - `reserve()` 只预约时刻、立即返回，可以放在慢建连之前；
+  - `wait_turn()` 在请求头发出前才放行，因此间隔计时锚定在真实发头瞬间，
+    而不是任务入队或建连开始；
+  - 目录、详情、影像区段、重试**共用同一个限流器、同一条间隔链**，不分类别。
+- **慢建连、慢响应体不挡其他请求**：建连发生在限流等待之外；票号在请求头
+  发出后立即离开 FIFO 队列，响应头/响应体再慢也只影响它自己，其他已就绪
+  worker 仍按最小间隔正常发头。
+- **429 / 503 的 `Retry-After` 触发全站统一暂停**：暂停窗口内任何 worker
+  都不能发出新请求头；**即使命中请求已用完重试次数，暂停也照样生效**，
+  之后该请求才以临时失败抛出。
+- 每条请求结束后在 `logs/requests.jsonl` 追加一行可核对记录：
+  `t_reserve / t_connected / t_sent / t_response_head / t_done` 五个相对时刻，
+  以及 `connect_ms / gate_wait_ms / ttfb_ms / body_ms`、状态码、重试序号、
+  是否被暂停、`Retry-After` 与错误信息。
+
 
 ## 一、启动模拟站
 
@@ -100,7 +122,9 @@ data/
 ├── images/<卷宗号>/
 │   ├── v<n>_<校验前缀>.img   # 校验通过的完整影像（不可变，旧版保留）
 │   └── chunks/...            # 下载中的持久化区段（装配后清理）
-└── logs/run.log
+└── logs/
+    ├── run.log
+    └── requests.jsonl  # 逐条请求的发出时刻与阶段耗时（可核对限流口径）
 ```
 
 关键保证：
@@ -118,7 +142,29 @@ data/
 退出码：`0` 全部完成；`2` 仍有卷宗待补齐（状态已落盘，再跑一次即可续）；
 `73` 工作目录被其他进程占用。
 
-## 五、一条命令完成端到端验证（80 秒内）
+## 五、一条命令回放并发交错（80 秒内）
+
+```bash
+python3 replay.py            # 自动找端口、临时目录，结束打印发出时间线与 PASS/FAIL
+python3 replay.py --keep     # 保留现场，requests.jsonl 可逐条核对
+```
+
+回放脚本在进程内起一个带 `ReplayPlan` 的模拟站，用真实的 `RateLimiter + Client`
+多线程并发打三类交错流量，并打印每条请求的 `t_sent`（请求头实际发出时刻）、
+阶段耗时与结果，自动核对：
+
+| 规则 | 核对点 |
+|---|---|
+| R1 | 相邻 `t_sent` 之差始终 ≥ `min_interval`；目录/详情/影像/重试混合计时，无类别豁免 |
+| R2 | 429 与 503 的 `Retry-After` 都触发全站暂停；`max_retries=0` 耗尽时暂停仍生效 |
+| R3 | 慢首字节 / 慢响应体在途窗口内，其他请求照常按间隔发出（不被慢连接挡住） |
+| R4 | 请求头按 FIFO 单调发出，后取票不能插队 |
+
+模拟站另外暴露回放专用端点（前缀 `/_replay/`，同样计入滚动窗口限流）：
+`slow-head`（慢首字节）、`slow-body`（分块慢写响应体）、`rate429`、
+`busy503`（按计划次数返回带 `Retry-After` 的状态码，耗尽后恢复 200）、`ok`。
+
+## 六、一条命令完成端到端验证（80 秒内）
 
 ```bash
 python3 verify.py
@@ -135,7 +181,7 @@ python3 verify.py --workdir ./verify_data --keep
 验证脚本内部会：全量下载中 `SIGKILL` 强杀 → 同目录续采并断言“复用 N 段” →
 等到补登条目与换版生效后跑增量 → 对所有当前影像重新计算 sha256 比对。
 
-## 六、运行单元测试
+## 七、运行单元测试
 
 ```bash
 python3 -m unittest discover -s tests -v

@@ -140,6 +140,8 @@ class WorkDir:
         self.failed_file = self.state_dir / "failed.json"
         self.events_file = self.manifest_dir / "events.jsonl"
         self.current_file = self.manifest_dir / "current.json"
+        # 逐条请求记录（请求头实际发出时刻 / 阶段耗时 / 状态码）
+        self.requests_log_file = self.log_dir / "requests.jsonl"
         self.lock_file = self.state_dir / "lock"
         self._lock_fh = None
 

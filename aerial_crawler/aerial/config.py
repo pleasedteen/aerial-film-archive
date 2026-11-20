@@ -13,9 +13,11 @@ class Config:
     workdir: Path
     # 并发 worker 数（所有 worker 共用同一个限流器）
     workers: int = 4
-    # 全站统一的最小请求发起间隔（秒）
+    # 全站统一的最小请求发起间隔（秒，以请求头实际发出时刻为准）
     min_interval: float = 0.05
+    # 建连阶段超时（秒）；建连慢不会占用限流器队首
     connect_timeout: float = 5.0
+    # 请求头发出后等待响应头 / 读取响应体的超时（秒）
     read_timeout: float = 30.0
     # 单次请求的最大重试次数（临时故障 / 5xx / 503）
     max_retries: int = 6

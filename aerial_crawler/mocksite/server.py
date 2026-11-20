@@ -39,6 +39,54 @@ class _RateWindow:
             return True
 
 
+class ReplayPlan:
+    """回放端点的可配置故障计划（线程安全）。
+
+    - status 计划：前 count 次命中该端点返回指定状态码（带 Retry-After），
+      之后恢复 200；
+    - 延迟计划：每次命中都按固定秒数制造慢首字节 / 慢响应体，
+      用于验证“慢建连/慢响应体不挡其他已就绪请求”。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # endpoint -> [剩余次数, 状态码, retry_after]
+        self.status_plans: dict[str, list] = {}
+        # endpoint -> 慢首字节秒数
+        self.slow_head: dict[str, float] = {}
+        # endpoint -> 慢响应体秒数
+        self.slow_body: dict[str, float] = {}
+
+    def set_status(self, endpoint: str, count: int,
+                   status: int, retry_after: float = 1.0) -> None:
+        with self._lock:
+            self.status_plans[endpoint] = [count, status, retry_after]
+
+    def set_slow_head(self, endpoint: str, seconds: float) -> None:
+        with self._lock:
+            self.slow_head[endpoint] = seconds
+
+    def set_slow_body(self, endpoint: str, seconds: float) -> None:
+        with self._lock:
+            self.slow_body[endpoint] = seconds
+
+    def take_status(self, endpoint: str) -> tuple[int, float] | None:
+        with self._lock:
+            plan = self.status_plans.get(endpoint)
+            if not plan or plan[0] <= 0:
+                return None
+            plan[0] -= 1
+            return plan[1], plan[2]
+
+    def get_slow_head(self, endpoint: str) -> float:
+        with self._lock:
+            return self.slow_head.get(endpoint, 0.0)
+
+    def get_slow_body(self, endpoint: str) -> float:
+        with self._lock:
+            return self.slow_body.get(endpoint, 0.0)
+
+
 class MockHandler(BaseHTTPRequestHandler):
     server_version = "MockArchive/1.0"
 
@@ -91,10 +139,59 @@ class MockHandler(BaseHTTPRequestHandler):
             self._handle_detail(path.rsplit("/", 1)[-1])
         elif path.startswith("/images/"):
             self._handle_image(path.rsplit("/", 1)[-1])
+        elif path.startswith("/_replay/"):
+            self._handle_replay(path.rsplit("/", 1)[-1])
         else:
             self._send(404, b"<html><body>not found</body></html>")
 
     do_HEAD = do_GET
+
+    # ------------------------------------------------------------------ #
+    def _handle_replay(self, endpoint: str) -> None:
+        """回放专用端点：慢首字节 / 慢响应体 / 429 / 恒定 503。
+
+        路由（均计入滚动窗口限流，健康检查之外一视同仁）：
+          /_replay/slow-head   配置后延迟回响应头（模拟慢建连后慢首字节）
+          /_replay/slow-body   响应头秒回，响应体按配置放慢写出（模拟慢响应体）
+          /_replay/rate429     按计划返回 429 + Retry-After，耗尽后 200
+          /_replay/busy503     按计划返回 503 + Retry-After，耗尽后 200
+          /_replay/ok          始终秒回 200
+        计划通过 ReplayPlan 注入（见 build_server / replay 验证脚本）。
+        """
+        plan: ReplayPlan = self.replay_plan
+        hit = plan.take_status(endpoint)
+        if hit is not None:
+            status, retry_after = hit
+            self._send(
+                status,
+                b"<html><body>replay fault</body></html>",
+                extra_headers={"Retry-After": str(retry_after)},
+            )
+            log.info("回放端点 %s 注入故障 %s Retry-After=%s",
+                     endpoint, status, retry_after)
+            return
+
+        slow_head = plan.get_slow_head(endpoint)
+        if slow_head > 0:
+            time.sleep(slow_head)  # 线程化服务：只拖慢当前连接
+
+        slow_body = plan.get_slow_body(endpoint)
+        body = b"".join(bytes([i % 256]) for i in range(4096))
+        if slow_body <= 0:
+            self._send(200, body, "application/octet-stream")
+            return
+
+        # 慢响应体：响应头立即发出，body 分块睡眠写出
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Site-Time", str(self._site_time()))
+        self.end_headers()
+        block = 256
+        for start in range(0, len(body), block):
+            self.wfile.write(body[start:start + block])
+            self.wfile.flush()
+            time.sleep(slow_body)
 
     # ------------------------------------------------------------------ #
     def _handle_catalog(self, query: dict[str, list[str]]) -> None:
@@ -230,7 +327,8 @@ class MockHandler(BaseHTTPRequestHandler):
         )
 
 
-def build_server(host: str, port: int, rate: int) -> ThreadingHTTPServer:
+def build_server(host: str, port: int, rate: int,
+                 replay_plan: ReplayPlan | None = None) -> ThreadingHTTPServer:
     scenario = Scenario(rate=rate)
     rate_window = _RateWindow(RATE_LIMIT_PER_SECOND)
     real_start = time.monotonic()
@@ -239,9 +337,11 @@ def build_server(host: str, port: int, rate: int) -> ThreadingHTTPServer:
     handler.scenario = scenario
     handler.rate_window = rate_window
     handler.real_start = real_start
+    handler.replay_plan = replay_plan or ReplayPlan()
 
     server = ThreadingHTTPServer((host, port), handler)
     server.scenario = scenario            # type: ignore[attr-defined]
     server.rate_window = rate_window      # type: ignore[attr-defined]
+    server.replay_plan = handler.replay_plan  # type: ignore[attr-defined]
     server.daemon_threads = True
     return server

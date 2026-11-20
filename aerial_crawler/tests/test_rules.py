@@ -169,19 +169,64 @@ class IncrementalHorizonTests(unittest.TestCase):
 class RateLimiterTests(unittest.TestCase):
     def test_min_interval_between_dispatches(self) -> None:
         rl = RateLimiter(0.05)
-        rl.acquire()
+        t1 = rl.acquire()
         t0 = time.monotonic()
-        rl.acquire()
+        t2 = rl.acquire()
         self.assertGreaterEqual(time.monotonic() - t0, 0.045)
         self.assertEqual(rl.dispatched, 2)
+        # 发出时刻之差满足最小间隔（以记录在票号上的实际发出时刻为准）
+        self.assertGreaterEqual(t2.sent_at - t1.sent_at, 0.045)
+        rl.release(t1)
+        rl.release(t2)
 
     def test_pause_holds_all_acquirers(self) -> None:
         rl = RateLimiter(0.0)
         rl.pause(0.2, "test")
         t0 = time.monotonic()
-        rl.acquire()
+        ticket = rl.acquire()
         self.assertGreaterEqual(time.monotonic() - t0, 0.18)
         self.assertEqual(rl.pause_events, 1)
+        self.assertTrue(ticket.paused)
+        rl.release(ticket)
+
+    def test_fifo_order_and_ticket_lifecycle(self) -> None:
+        rl = RateLimiter(0.03)
+        tickets = [rl.reserve() for _ in range(4)]
+        # 票号按取票顺序排队
+        self.assertEqual([t.idx for t in tickets], [0, 1, 2, 3])
+        sent_order = []
+        for t in tickets:
+            rl.wait_turn(t)
+            sent_order.append(t.idx)
+            rl.release(t)
+        self.assertEqual(sent_order, [0, 1, 2, 3])
+
+    def test_slow_inflight_does_not_block_queue_head(self) -> None:
+        """票号发头即离队：慢响应体阶段不挡后续已就绪请求。"""
+        rl = RateLimiter(0.02)
+        first = rl.reserve()
+        rl.wait_turn(first)  # 已发出但故意不 release，模拟慢响应体在途
+        second = rl.reserve()
+        t0 = time.monotonic()
+        rl.wait_turn(second)  # 只需等一个最小间隔，而非等 first 结束
+        waited = time.monotonic() - t0
+        self.assertLess(waited, 0.1)
+        # 两张票都已发出在途（first 模拟慢响应体仍未结束），等待队列为空
+        snap = rl.snapshot()
+        self.assertEqual(snap["inflight"], 2)
+        self.assertEqual(snap["waiting"], 0)
+        rl.release(first)
+        rl.release(second)
+
+    def test_connect_phase_reservation_does_not_dispatch(self) -> None:
+        """慢建连期间票号只预约未发出：dispatched 不增加，队首不变。"""
+        rl = RateLimiter(0.0)
+        ticket = rl.reserve()
+        self.assertEqual(rl.dispatched, 0)
+        self.assertIsNone(ticket.sent_at)
+        self.assertEqual(rl.snapshot()["waiting"], 1)
+        rl.release(ticket)
+        self.assertEqual(rl.snapshot()["waiting"], 0)
 
 
 class ParsingTests(unittest.TestCase):
@@ -257,6 +302,98 @@ class ScenarioTests(unittest.TestCase):
             hashlib.sha256(data1).hexdigest(),
             s1.volumes["V0001"].versions[0].checksum,
         )
+
+
+class HTTPClientReplayTests(unittest.TestCase):
+    """起进程内模拟站，验证客户端的计时口径与暂停语义。"""
+
+    def setUp(self) -> None:
+        import threading
+        from mocksite.server import ReplayPlan, build_server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.plan = ReplayPlan()
+        self.httpd = build_server("127.0.0.1", 0, rate=20,
+                                  replay_plan=self.plan)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(self.httpd.shutdown)
+        self.addCleanup(self.httpd.server_close)
+
+    def _client(self, max_retries: int = 3, min_interval: float = 0.05):
+        from aerial.http import Client
+        from aerial.request_log import RequestLog
+        wd = Path(self.tmp.name)
+        cfg = Config(
+            base_url=f"http://127.0.0.1:{self.port}",
+            workdir=wd, min_interval=min_interval,
+            max_retries=max_retries, backoff_base=0.01, backoff_cap=0.05,
+        )
+        limiter = RateLimiter(min_interval)
+        req_log = RequestLog(None)  # 只留内存，不落盘
+        return Client(cfg, limiter, req_log), limiter, req_log
+
+    def test_pause_applies_even_when_retries_exhausted(self) -> None:
+        from aerial.http import TransientHTTPError
+        self.plan.set_status("always503", count=5, status=503, retry_after=0.5)
+        client, limiter, _ = self._client(max_retries=0)
+        with self.assertRaises(TransientHTTPError):
+            client.get("/_replay/always503")
+        # 请求虽失败，统一暂停必须已登记
+        self.assertEqual(limiter.pause_events, 1)
+        # 暂停窗口内的新请求被推迟
+        t0 = time.monotonic()
+        client.get("/_replay/ok")
+        self.assertGreaterEqual(time.monotonic() - t0, 0.45)
+
+    def test_429_retry_after_pauses_then_succeeds(self) -> None:
+        self.plan.set_status("rate429", count=1, status=429, retry_after=0.3)
+        client, limiter, req_log = self._client(max_retries=2)
+        resp = client.get("/_replay/rate429")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(limiter.pause_events, 1)
+        statuses = [r["status"] for r in req_log.records]
+        self.assertEqual(statuses[0], 429)
+        self.assertIn(200, statuses)
+        # 记录里带 Retry-After 与 paused 标记
+        self.assertEqual(req_log.records[0]["retry_after"], "0.3")
+
+    def test_min_interval_anchored_at_header_send_time(self) -> None:
+        client, _limiter, req_log = self._client(min_interval=0.08)
+        for _ in range(4):
+            client.get("/_replay/ok")
+        sent = [r["t_sent"] for r in req_log.records if r["t_sent"] is not None]
+        self.assertEqual(len(sent), 4)
+        for a, b in zip(sent, sent[1:]):
+            self.assertGreaterEqual(b - a, 0.08 - 0.01)
+
+    def test_slow_body_does_not_block_other_requests(self) -> None:
+        import threading
+        self.plan.set_slow_body("slow-body", 0.05)
+        client, _limiter, req_log = self._client(min_interval=0.05)
+        err: list[Exception] = []
+
+        def slow() -> None:
+            try:
+                client.get("/_replay/slow-body")
+            except Exception as exc:  # noqa: BLE001
+                err.append(exc)
+
+        t = threading.Thread(target=slow)
+        t.start()
+        # 等慢请求头发出去
+        deadline = time.monotonic() + 3
+        while not req_log.records and time.monotonic() < deadline:
+            time.sleep(0.005)
+        t0 = time.monotonic()
+        client.get("/_replay/ok")
+        peer_gap = time.monotonic() - t0
+        t.join(timeout=10)
+        self.assertFalse(err)
+        # 同伴请求只受最小间隔约束，没有被慢响应体拖住
+        self.assertLess(peer_gap, 0.5)
 
 
 if __name__ == "__main__":

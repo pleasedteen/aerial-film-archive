@@ -26,6 +26,7 @@ from .http import Client, PermanentHTTPError, TransientHTTPError
 from .limiter import RateLimiter
 from .manifest import Manifest
 from .parsing import CatalogEntry, VolumeDetail, parse_catalog, parse_detail
+from .request_log import RequestLog
 from .state import FailedItem, FailedQueue, ScanState, WorkDir
 
 log = logging.getLogger(__name__)
@@ -50,7 +51,8 @@ class Scanner:
         self.wd = workdir
         self.mode = mode
         self.limiter = RateLimiter(cfg.min_interval)
-        self.client = Client(cfg, self.limiter)
+        self.request_log = RequestLog(workdir.requests_log_file)
+        self.client = Client(cfg, self.limiter, self.request_log)
         self.manifest = Manifest(workdir.events_file, workdir.current_file)
         self.downloader = ImageDownloader(cfg, self.client, self.manifest)
         self.state = ScanState.load(workdir.state_file)
