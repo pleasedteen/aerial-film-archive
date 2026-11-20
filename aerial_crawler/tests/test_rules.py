@@ -146,6 +146,69 @@ class IncrementalHorizonTests(unittest.TestCase):
         self.assertEqual(len(sc._seen_catalog), 2)
         self.assertEqual(sorted(u for _, u in sc._seen_catalog), [150, 700])
 
+    def test_incremental_unchanged_volume_skips_detail(self) -> None:
+        """未变卷宗（目录 updated_at 等于本地基线）不查详情。"""
+        sc = self._scanner("incremental", known={"V0001"}, last_time=1000)
+        sc._known_updated["V0001"] = 900
+        sc._consider_entry(CatalogEntry("V0001", "/volumes/V0001", 900), 500)
+        self.assertFalse(sc._seen_catalog)
+        # 严格更大的更新时间才算换版
+        sc._consider_entry(CatalogEntry("V0001", "/volumes/V0001", 901), 500)
+        self.assertEqual(set(sc._seen_catalog), {("V0001", 901)})
+
+    def test_incremental_revision_at_watermark_second_still_found(self) -> None:
+        """与上次扫描水位同秒的换版：updated_at 更大，仍会被找回。"""
+        sc = self._scanner("incremental", known={"V0002"}, last_time=1000)
+        sc._known_updated["V0002"] = 990
+        sc._consider_entry(CatalogEntry("V0002", "/volumes/V0002", 1000), 400)
+        self.assertEqual(set(sc._seen_catalog), {("V0002", 1000)})
+
+    def test_incremental_long_gap_still_covers_floor(self) -> None:
+        """停采很久（站点时间远超水位）也只看水位-窗口，不漏登。"""
+        sc = self._scanner("incremental", known={"V0001"}, last_time=1000)
+        # 水位 1000、窗口 600 → 地平线 400；不看“现在”
+        self.assertEqual(sc._incremental_floor_from_state(), 400)
+        # 更新时间 399 的未知条目：上次扫描时已可见，不再翻
+        sc._consider_entry(CatalogEntry("V9999", "/volumes/V9999", 399), 400)
+        self.assertFalse(sc._seen_catalog)
+        # 更新时间 400（漏登边界）的未知条目：仍在窗口内，必须找回
+        sc._consider_entry(CatalogEntry("V9998", "/volumes/V9998", 400), 400)
+        self.assertEqual(set(sc._seen_catalog), {("V9998", 400)})
+
+    def test_stop_paging_when_page_all_older_than_floor(self) -> None:
+        from aerial.parsing import CatalogPage
+        sc = self._scanner("incremental", known=set(), last_time=1000)
+        newer = CatalogPage(
+            entries=[CatalogEntry("V1", "/volumes/V1", 900),
+                     CatalogEntry("V2", "/volumes/V2", 800)],
+            next_page="/catalog?page=2",
+        )
+        older = CatalogPage(
+            entries=[CatalogEntry("V3", "/volumes/V3", 300),
+                     CatalogEntry("V4", "/volumes/V4", 200)],
+            next_page="/catalog?page=3",
+        )
+        self.assertFalse(sc._should_stop_paging(newer, 500))
+        self.assertTrue(sc._should_stop_paging(older, 500))
+        # 全量模式（无地平线）必须翻完
+        self.assertFalse(sc._should_stop_paging(older, None))
+
+    def test_catalog_progress_resume_skips_confirmed_pages(self) -> None:
+        from aerial.state import CatalogProgress
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "scan.json"
+        prog = CatalogProgress(mode="incremental", prev_watermark=1000,
+                               main_pages_done=7,
+                               main_next_url="/catalog?page=8")
+        prog.save(path)
+        loaded = CatalogProgress.load(path)
+        self.assertTrue(loaded.matches("incremental", 1000))
+        self.assertEqual(loaded.main_next_url, "/catalog?page=8")
+        # 水位不同（新一轮扫描）时不得沿用旧断点
+        self.assertFalse(loaded.matches("incremental", 1001))
+        self.assertFalse(loaded.matches("full", 1000))
+
     def test_empty_catalog_keeps_waiting_until_backfill_window_passes(self) -> None:
         sc = self._scanner("full", known=set(), last_time=None)
         # 未观察到空目录：不等待

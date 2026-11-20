@@ -105,10 +105,79 @@ def build_volumes() -> dict[str, Volume]:
     return {v.volume_id: v for v in volumes}
 
 
+def build_large_catalog(history_pages: int,
+                        history_base: int = 0,
+                        history_spacing: int = 60,
+                        last_scan_offset: int = 600,
+                        missed_offset: int = 480,
+                        missed_seen_offset: int = 620) -> dict[str, Volume]:
+    """大目录场景：history_pages 页历史卷宗 + 3 处变化。
+
+    用于验证增量不会翻完整个目录：
+      - H####：历史卷宗，更新时间从 history_base 起每卷依次变旧
+        （跨度 history_spacing 秒；为 0 时全部同一时刻，用于验证续采），
+        占满 history_pages 页中的其余位置；
+      - C0001：换版（v1 已在上次扫描时采到，v2 更新于 last_scan_offset+50）；
+      - C0002：与上次扫描水位同秒的换版（v2 恰好更新于 last_scan_offset）；
+      - C0003：漏登卷宗（更新时间 missed_offset，早于水位但目录迟到到
+        missed_seen_offset 才出现，仍在补登窗口内）。
+    历史卷宗数按 PAGE_SIZE 补足，保证总条目数正好 history_pages 页。
+    """
+    t = lambda offset: VIRTUAL_EPOCH + offset  # noqa: E731
+    changes = [
+        # 换版：v1 在上次扫描时已采，v2 是扫描之后的新版本
+        Volume(
+            "C0001",
+            [_ver(1, t(100), 2048, 3001),
+             _ver(2, t(last_scan_offset + 50), 2048, 4001)],
+            first_seen_at=t(-100_000),
+        ),
+        # 与上次扫描水位同秒的换版：v1 更新于水位 -10，v2 恰好等于水位
+        Volume(
+            "C0002",
+            [_ver(1, t(last_scan_offset - 10), 2048, 3002),
+             _ver(2, t(last_scan_offset), 2048, 4002)],
+            first_seen_at=t(-100_000),
+        ),
+        # 漏登：更新时间早于水位，但目录迟到才出现
+        Volume(
+            "C0003",
+            [_ver(1, t(missed_offset), 2048, 3003)],
+            first_seen_at=t(missed_seen_offset),
+        ),
+    ]
+    history_count = max(0, history_pages * PAGE_SIZE - len(changes))
+    history = [
+        Volume(f"H{i:05d}",
+               [_ver(1, t(history_base - history_spacing * i), 64, 9000 + i)],
+               first_seen_at=t(-100_000))
+        for i in range(1, history_count + 1)
+    ]
+    return {v.volume_id: v for v in changes + history}
+
+
 class Scenario:
-    def __init__(self, rate: int = DEFAULT_RATE) -> None:
+    def __init__(self, rate: int = DEFAULT_RATE, history_pages: int = 0,
+                 start_site_time: int | None = None,
+                 history_base: int = 0,
+                 history_spacing: int = 60,
+                 last_scan_offset: int = 600,
+                 missed_offset: int = 480,
+                 missed_seen_offset: int = 620) -> None:
         self.rate = rate
-        self.volumes = build_volumes()
+        self._start_site_time = start_site_time
+        self.history_pages = history_pages
+        if history_pages:
+            self.volumes = build_large_catalog(
+                history_pages,
+                history_base=history_base,
+                history_spacing=history_spacing,
+                last_scan_offset=last_scan_offset,
+                missed_offset=missed_offset,
+                missed_seen_offset=missed_seen_offset,
+            )
+        else:
+            self.volumes = build_volumes()
         # 预生成全部影像内容（总量约 1.1 MB）
         self.images: dict[tuple[str, int], bytes] = {}
         for vol in self.volumes.values():
@@ -119,7 +188,10 @@ class Scenario:
         self._fail_lock = __import__("threading").Lock()
 
     def site_time(self, real_now: float, real_start: float) -> int:
-        return VIRTUAL_EPOCH + int((real_now - real_start) * self.rate)
+        elapsed = int((real_now - real_start) * self.rate)
+        base = self._start_site_time if self._start_site_time is not None \
+            else VIRTUAL_EPOCH
+        return base + elapsed
 
     def catalog_entries(self, site_time: int) -> list[Volume]:
         """当前站点时间可见的卷宗，按当前版本更新时间倒序。"""

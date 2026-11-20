@@ -18,6 +18,33 @@ RATE_LIMIT_PER_SECOND = 14
 RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
+class RequestStats:
+    """按资源类别统计成功请求数（验证脚本读取 /stats 判定增量代价）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.counts = {"catalog": 0, "volume": 0, "image": 0, "other": 0}
+        self.catalog_pages: list[int] = []
+        self.site_time_at_reset = 0
+
+    def record(self, kind: str, page: int = 0) -> None:
+        with self._lock:
+            self.counts[kind] = self.counts.get(kind, 0) + 1
+            if kind == "catalog":
+                self.catalog_pages.append(page)
+
+    def reset(self, site_time: int) -> None:
+        with self._lock:
+            self.counts = {"catalog": 0, "volume": 0, "image": 0, "other": 0}
+            self.catalog_pages = []
+            self.site_time_at_reset = site_time
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self.counts, catalog_pages=list(self.catalog_pages),
+                        site_time_at_reset=self.site_time_at_reset)
+
+
 class _RateWindow:
     """1 秒滚动窗口限流（线程安全）。"""
 
@@ -45,7 +72,9 @@ class MockHandler(BaseHTTPRequestHandler):
     # 由 server 实例注入
     scenario: Scenario
     rate_window: _RateWindow
+    stats: RequestStats
     real_start: float
+    catalog_delay: float = 0.0
 
     # ------------------------------------------------------------------ #
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
@@ -85,16 +114,38 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             self._send(200, b"ok", "text/plain")
+        elif path == "/stats":
+            self._handle_stats()
+        elif path == "/stats/reset":
+            self.stats.reset(self._site_time())
+            self._handle_stats()
         elif path == "/catalog":
-            self._handle_catalog(parse_qs(parts.query))
+            query = parse_qs(parts.query)
+            try:
+                page_no = max(1, int(query.get("page", ["1"])[0]))
+            except (ValueError, IndexError):
+                page_no = 1
+            self.stats.record("catalog", page_no)
+            if self.catalog_delay > 0:
+                time.sleep(self.catalog_delay)
+            self._handle_catalog(query)
         elif path.startswith("/volumes/"):
+            self.stats.record("volume")
             self._handle_detail(path.rsplit("/", 1)[-1])
         elif path.startswith("/images/"):
+            self.stats.record("image")
             self._handle_image(path.rsplit("/", 1)[-1])
         else:
+            self.stats.record("other")
             self._send(404, b"<html><body>not found</body></html>")
 
     do_HEAD = do_GET
+
+    # ------------------------------------------------------------------ #
+    def _handle_stats(self) -> None:
+        import json
+        body = json.dumps(self.stats.snapshot()).encode("utf-8")
+        self._send(200, body, "application/json; charset=utf-8")
 
     # ------------------------------------------------------------------ #
     def _handle_catalog(self, query: dict[str, list[str]]) -> None:
@@ -230,18 +281,28 @@ class MockHandler(BaseHTTPRequestHandler):
         )
 
 
-def build_server(host: str, port: int, rate: int) -> ThreadingHTTPServer:
-    scenario = Scenario(rate=rate)
+def build_server(host: str, port: int, rate: int = 20,
+                 history_pages: int = 0,
+                 start_site_time: int | None = None,
+                 catalog_delay: float = 0.0,
+                 scenario_kwargs: dict | None = None) -> ThreadingHTTPServer:
+    scenario = Scenario(rate=rate, history_pages=history_pages,
+                        start_site_time=start_site_time,
+                        **(scenario_kwargs or {}))
     rate_window = _RateWindow(RATE_LIMIT_PER_SECOND)
+    stats = RequestStats()
     real_start = time.monotonic()
 
     handler = MockHandler
     handler.scenario = scenario
     handler.rate_window = rate_window
+    handler.stats = stats
     handler.real_start = real_start
+    handler.catalog_delay = catalog_delay
 
     server = ThreadingHTTPServer((host, port), handler)
     server.scenario = scenario            # type: ignore[attr-defined]
     server.rate_window = rate_window      # type: ignore[attr-defined]
+    server.stats = stats                  # type: ignore[attr-defined]
     server.daemon_threads = True
     return server

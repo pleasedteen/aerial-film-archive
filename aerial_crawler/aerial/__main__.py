@@ -31,6 +31,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--retry-round-interval", type=float, default=1.0,
                    help="补齐轮之间的等待秒数")
     p.add_argument("--max-retries", type=int, default=6, help="单请求最大重试次数")
+    p.add_argument("--backfill-seconds", type=int, default=600,
+                   help="补登窗口（站点秒）：条目最迟在更新时间后多久上目录")
     p.add_argument("positional_mode", nargs="?", choices=("full", "incremental"))
     return p.parse_args(argv)
 
@@ -64,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         retry_rounds=args.retry_rounds,
         retry_round_interval=args.retry_round_interval,
         max_retries=args.max_retries,
+        backfill_seconds=args.backfill_seconds,
     )
     wd = WorkDir(cfg.workdir)
     setup_logging(wd.log_dir)

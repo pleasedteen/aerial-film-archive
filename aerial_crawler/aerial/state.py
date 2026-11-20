@@ -2,7 +2,8 @@
 
 工作目录布局：
     workdir/
-      state/state.json        扫描水位（模式、上次扫描站点时间、已知卷宗）
+      state/state.json        扫描水位（模式、上次扫描站点时间、已知卷宗、每卷版本基线）
+      state/scan.json         目录翻页断点（强杀后续采，不重读已确认的页）
       state/failed.json       待补齐卷宗（下载/详情临时失败，含已用尝试次数）
       state/lock              单实例文件锁
       manifest/events.jsonl   追加式事件清单（采集期间也可安全读取）
@@ -45,16 +46,24 @@ class ScanState:
     last_scan_site_time: Optional[int] = None
     # 历次扫描见过的所有卷宗号
     known_volumes: set[str] = field(default_factory=set)
+    # 每卷已校验入库的最新版本更新时间（站点秒）。
+    # 增量判断“是否换版”只用它：目录 updated_at 严格更大才重拉详情；
+    # 相等（未变）或更小（旧版）都不查详情。
+    known_updated_at: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "ScanState":
         if not path.exists():
             return cls()
         raw = json.loads(path.read_text(encoding="utf-8"))
+        known_updated = {
+            str(k): int(v) for k, v in raw.get("known_updated_at", {}).items()
+        }
         return cls(
             mode=raw.get("mode", "none"),
             last_scan_site_time=raw.get("last_scan_site_time"),
             known_volumes=set(raw.get("known_volumes", [])),
+            known_updated_at=known_updated,
         )
 
     def save(self, path: Path) -> None:
@@ -62,8 +71,92 @@ class ScanState:
             "mode": self.mode,
             "last_scan_site_time": self.last_scan_site_time,
             "known_volumes": sorted(self.known_volumes),
+            "known_updated_at": dict(sorted(self.known_updated_at.items())),
         }
         atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@dataclass
+class CatalogProgress:
+    """一次扫描中目录翻页的断点记录（强杀后续采用）。
+
+    目录按更新时间倒序，因此“已确认的页”不会在重启后重读：
+    记录下一页地址、已确认页数、本轮接受过的候选卷宗，以及本轮的站点水位。
+    只有模式与扫描前水位都对得上时才续采；否则按新一轮处理。
+
+    约定：
+    - main_* 描述主扫描（/catalog 逐页）；
+    - recheck_* 描述补齐轮次中的目录复查，round 为正在进行的补齐轮号，
+      done_rounds 为已完成轮数；
+    - 本轮已接受的候选另存于 state/scan.candidates.jsonl（逐页 fsync），
+      重启后重新入队；已完成的影像会被下载器按校验值复用，不会重复拉取。
+    """
+
+    mode: str = "none"
+    # 本轮开始前 state.last_scan_site_time 的值，用于识别“同一轮”
+    prev_watermark: Optional[int] = None
+    # 本轮第一页目录响应头里的站点时间（最终写回扫描水位）
+    round_start_site_time: Optional[int] = None
+    # 本轮增量的补登地平线（站点秒）；全量为 None
+    floor: Optional[int] = None
+    main_done: bool = False
+    main_next_url: Optional[str] = "/catalog"
+    main_pages_done: int = 0
+    recheck_done_rounds: int = 0
+    recheck_round: int = 0
+    recheck_next_url: Optional[str] = "/catalog"
+    recheck_pages_done: int = 0
+    catalog_was_empty: bool = False
+    empty_seen_site_time: Optional[int] = None
+    last_recheck_site_time: Optional[int] = None
+
+    def matches(self, mode: str, prev_watermark: Optional[int]) -> bool:
+        return self.mode == mode and self.prev_watermark == prev_watermark
+
+    @classmethod
+    def load(cls, path: Path) -> Optional["CatalogProgress"]:
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            log.warning("目录断点文件损坏，按新一轮处理: %s", path)
+            return None
+        return cls(
+            mode=raw.get("mode", "none"),
+            prev_watermark=raw.get("prev_watermark"),
+            round_start_site_time=raw.get("round_start_site_time"),
+            floor=raw.get("floor"),
+            main_done=bool(raw.get("main_done", False)),
+            main_next_url=raw.get("main_next_url"),
+            main_pages_done=int(raw.get("main_pages_done", 0)),
+            recheck_done_rounds=int(raw.get("recheck_done_rounds", 0)),
+            recheck_round=int(raw.get("recheck_round", 0)),
+            recheck_next_url=raw.get("recheck_next_url"),
+            recheck_pages_done=int(raw.get("recheck_pages_done", 0)),
+            catalog_was_empty=bool(raw.get("catalog_was_empty", False)),
+            empty_seen_site_time=raw.get("empty_seen_site_time"),
+            last_recheck_site_time=raw.get("last_recheck_site_time"),
+        )
+
+    def save(self, path: Path) -> None:
+        payload = {
+            "mode": self.mode,
+            "prev_watermark": self.prev_watermark,
+            "round_start_site_time": self.round_start_site_time,
+            "floor": self.floor,
+            "main_done": self.main_done,
+            "main_next_url": self.main_next_url,
+            "main_pages_done": self.main_pages_done,
+            "recheck_done_rounds": self.recheck_done_rounds,
+            "recheck_round": self.recheck_round,
+            "recheck_next_url": self.recheck_next_url,
+            "recheck_pages_done": self.recheck_pages_done,
+            "catalog_was_empty": self.catalog_was_empty,
+            "empty_seen_site_time": self.empty_seen_site_time,
+            "last_recheck_site_time": self.last_recheck_site_time,
+        }
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
 
 
 @dataclass
@@ -137,6 +230,7 @@ class WorkDir:
         for d in (self.state_dir, self.manifest_dir, self.images_dir, self.log_dir):
             d.mkdir(parents=True, exist_ok=True)
         self.state_file = self.state_dir / "state.json"
+        self.scan_file = self.state_dir / "scan.json"
         self.failed_file = self.state_dir / "failed.json"
         self.events_file = self.manifest_dir / "events.jsonl"
         self.current_file = self.manifest_dir / "current.json"
