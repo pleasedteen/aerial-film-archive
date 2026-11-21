@@ -2,17 +2,24 @@
 
 仅依赖标准库 http.client。每个请求都经过同一个 RateLimiter；
 收到 503/429 + Retry-After 时通过限流器统一暂停全部 worker。
+
+会话取消：
+- Client 绑定一个 CancelToken；每次请求前、限流等待中、退避睡眠中、读响应体
+  时都会检查它；
+- 在途连接注册到令牌的关闭器集合，停采时被 shutdown，阻塞中的
+  connect / getresponse / read 立刻返回 OSError，随后转成 Cancelled。
+- 取消后绝不会再发起新请求。
 """
 from __future__ import annotations
 
 import http.client
 import logging
 import random
-import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlsplit, urljoin
 
+from .cancel import CancelToken, Cancelled
 from .config import Config
 from .limiter import RateLimiter
 
@@ -42,9 +49,11 @@ class Response:
 
 
 class Client:
-    def __init__(self, config: Config, limiter: RateLimiter) -> None:
+    def __init__(self, config: Config, limiter: RateLimiter,
+                 token: Optional[CancelToken] = None) -> None:
         self.cfg = config
         self.limiter = limiter
+        self.token = token
         parts = urlsplit(config.base_url)
         if parts.scheme not in ("http", "https"):
             raise ValueError("base_url 必须是 http(s)")
@@ -74,8 +83,13 @@ class Client:
             url = self._prefix + "/" + url
         return url
 
+    def _check(self) -> None:
+        if self.token is not None:
+            self.token.check()
+
     def _one_request(self, target: str, headers: dict[str, str]) -> Response:
         """真正发起一次请求（调用方负责限流与重试）。"""
+        self._check()
         conn: http.client.HTTPConnection
         if self._scheme == "https":
             conn = http.client.HTTPSConnection(
@@ -87,13 +101,41 @@ class Client:
                 self._host, self._port,
                 timeout=self.cfg.read_timeout,
             )
+        closer = CancelToken.socket_closer(conn) if self.token is not None else None
+        if closer is not None:
+            # register 时若已取消会抛 Cancelled，避免竞态下发出请求
+            self.token.add_closer(closer)  # type: ignore[union-attr]
         try:
+            self._check()
+            # 先建立连接并登记 socket，再发请求：即使 request() 刚写到一半被
+            # cancel，shutdown 也能立即打断，且请求字节数被降到最少。
+            conn.connect()
+            self._check()
             conn.request("GET", target, headers=headers)
             resp = conn.getresponse()
-            data = resp.read()
+            # 分块读取响应体，保证取消后不会把整段读完
+            chunks: list[bytes] = []
+            while True:
+                self._check()
+                block = resp.read(64 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            # socket 被取消关闭时 read 可能返回空（EOF）而非抛错，再确认一次
+            self._check()
+            data = b"".join(chunks)
             raw = {k.lower(): v for k, v in resp.getheaders()}
             status = resp.status
+        except Cancelled:
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            # 取消导致的 socket 关闭：转成 Cancelled，绝不当作网络故障重试
+            if self.token is not None and self.token.cancelled:
+                raise Cancelled() from exc
+            raise
         finally:
+            if closer is not None:
+                self.token.remove_closer(closer)  # type: ignore[union-attr]
             conn.close()
 
         site_time_raw = raw.get("x-site-time")
@@ -113,7 +155,8 @@ class Client:
         - 503/429：解析 Retry-After，调用 limiter.pause 统一推迟后重试；
         - 5xx / 连接错误：指数退避 + 抖动重试；
         - 404：抛 PermanentHTTPError（补登窗口内由上层当作“稍后再试”处理）；
-        - 其他 4xx：抛 PermanentHTTPError。
+        - 其他 4xx：抛 PermanentHTTPError；
+        - 会话被取消：任何时候都抛 Cancelled，且不再发起新请求。
         """
         target = self._target(url)
         headers = {
@@ -126,10 +169,15 @@ class Client:
 
         attempt = 0
         while True:
-            self.limiter.acquire()
+            self._check()
+            self.limiter.acquire(self.token)
+            self._check()
             try:
                 resp = self._one_request(target, headers)
+            except Cancelled:
+                raise
             except (OSError, http.client.HTTPException) as exc:
+                self._check()
                 if attempt >= self.cfg.max_retries:
                     raise TransientHTTPError(f"连接失败且重试耗尽: {target}: {exc}") from exc
                 self._sleep_backoff(attempt, f"连接异常 {exc}")
@@ -142,6 +190,8 @@ class Client:
                 retry_after = self._parse_retry_after(resp.headers.get("retry-after"))
                 # 站点要求暂停：统一推迟所有新请求
                 self.limiter.pause(retry_after, reason=f"HTTP {resp.status} {target}")
+                if self.token is not None:
+                    self.token.sleep(0)  # 取消则立刻退出
                 attempt += 1
                 self.retries += 1
                 continue
@@ -164,7 +214,11 @@ class Client:
         delay *= 0.5 + random.random()  # 抖动，避免并发 worker 同步重连
         self.retries += 1
         log.info("临时故障（%s），第 %d 次退避 %.2fs", reason, attempt + 1, delay)
-        time.sleep(delay)
+        if self.token is not None:
+            self.token.sleep(delay)
+        else:
+            import time
+            time.sleep(delay)
 
     @staticmethod
     def _parse_retry_after(value: Optional[str]) -> float:
@@ -176,6 +230,7 @@ class Client:
         # 支持 HTTP-date 形式（本项目模拟站始终发 delta-seconds）
         try:
             from email.utils import parsedate_to_datetime
+            import time
             ts = parsedate_to_datetime(value).timestamp()
             return max(0.0, ts - time.time())
         except (TypeError, ValueError):

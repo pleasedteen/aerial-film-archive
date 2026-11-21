@@ -12,6 +12,12 @@
       logs/run.log
 
 强制 kill 后状态文件本身用“临时文件 + os.replace”原子写入，绝不会出现半截 JSON。
+
+会话停止：
+- 所有写动作都经 ``atomic_write_text`` / ``CancelToken.writing()`` 门闩；
+  会话停止后合上闩，写入抛 Cancelled，保证停采后不再写文件。
+- 持有时也可以显式忘掉某个卷宗（``WorkDir.forget_volume``）：会话在停止时
+  若已写入一半，删掉未提交的半成品，保证“该会话不能再写文件”且原目录干净。
 """
 from __future__ import annotations
 
@@ -19,21 +25,33 @@ import fcntl
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .cancel import CancelToken
+
 log = logging.getLogger(__name__)
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+def atomic_write_text(path: Path, text: str,
+                      token: Optional[CancelToken] = None) -> None:
+    """原子写入；token 存在时全程受写入门闩保护。"""
+    def _write() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+
+    if token is None:
+        _write()
+    else:
+        with token.writing():
+            _write()
 
 
 @dataclass
@@ -57,13 +75,14 @@ class ScanState:
             known_volumes=set(raw.get("known_volumes", [])),
         )
 
-    def save(self, path: Path) -> None:
+    def save(self, path: Path, token: Optional[CancelToken] = None) -> None:
         payload = {
             "mode": self.mode,
             "last_scan_site_time": self.last_scan_site_time,
             "known_volumes": sorted(self.known_volumes),
         }
-        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2),
+                          token=token)
 
 
 @dataclass
@@ -95,8 +114,9 @@ class FailedItem:
 class FailedQueue:
     """待补齐卷宗的持久化队列，按卷宗号去重（保留最大尝试次数）。"""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, token: Optional[CancelToken] = None) -> None:
         self.path = path
+        self.token = token
         self._items: dict[str, FailedItem] = {}
         if path.exists():
             for d in json.loads(path.read_text(encoding="utf-8")):
@@ -122,7 +142,8 @@ class FailedQueue:
 
     def _persist(self) -> None:
         data = [item.to_dict() for item in self._items.values()]
-        atomic_write_text(self.path, json.dumps(data, ensure_ascii=False, indent=2))
+        atomic_write_text(self.path, json.dumps(data, ensure_ascii=False, indent=2),
+                          token=self.token)
 
 
 class WorkDir:
@@ -159,3 +180,23 @@ class WorkDir:
             fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
             self._lock_fh.close()
             self._lock_fh = None
+
+    # ------------------------------------------------------------------ #
+    def forget_volume(self, volume_id: str) -> None:
+        """删除某卷宗目录下未提交的下载残留（区段、.part、.assembling）。
+
+        会话被停止时调用：已校验通过的完整影像（提交进 current.json 的）
+        必须保留，未完成的半成品删除，保证原目录再启动时从干净的区段状态
+        续采。此操作只删除可重建的临时文件。
+        """
+        vol_dir = self.images_dir / volume_id
+        if not vol_dir.exists():
+            return
+        for child in list(vol_dir.iterdir()):
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                elif child.name.endswith((".part", ".assembling")):
+                    child.unlink(missing_ok=True)
+            except OSError:
+                pass

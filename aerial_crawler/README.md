@@ -9,18 +9,22 @@
 aerial_crawler/
 ├── aerial/                # 采集端
 │   ├── config.py          # 运行配置（间隔、并发、退避、补登窗口等）
-│   ├── limiter.py         # 全站共享的最小发起间隔限流器 + 统一暂停
-│   ├── http.py            # 退避重试 / 503 统一暂停 / Range 分段的 HTTP 客户端
+│   ├── cancel.py          # 会话级取消令牌（可取消 sleep / 取消在途连接 / 写入门闩）
+│   ├── limiter.py         # 全站共享的最小发起间隔限流器 + 统一暂停（支持每会话取消）
+│   ├── http.py            # 退避重试 / 503 统一暂停 / Range 分段的可取消 HTTP 客户端
 │   ├── parsing.py         # 分页目录与卷宗详情 HTML 解析
 │   ├── state.py           # 工作目录状态（水位、失败队列、单实例锁、原子写）
 │   ├── manifest.py        # JSON Lines 事件清单 + 每卷当前条目原子视图
 │   ├── downloader.py      # 分段下载、断点区段复用、sha256 校验装配
-│   └── scanner.py         # 全量 / 增量采集调度、worker 池、补齐轮次
+│   ├── scanner.py         # 全量 / 增量采集调度引擎（可取消）
+│   └── session.py         # 采集会话：可并行、可独立停止、可续采
 ├── mocksite/              # 可回放的 HTTP 模拟站
 │   ├── scenario.py        # 固定场景与 20 倍速虚拟站点时钟
-│   └── server.py          # 分页目录 / 详情 / Range 影像 / 故障注入 / 限流
+│   └── server.py          # 分页目录 / 详情 / Range 影像 / 故障注入 / 限流 / 阻塞控制
 ├── tests/test_rules.py    # 规则级单元测试（unittest）
+├── tests/test_cancel.py   # 会话取消规则级单元测试（unittest）
 ├── verify.py              # 一条命令的端到端验证（80 秒内出可读报告）
+├── verify_sessions.py     # 会话级端到端验证：并行 / 独立停止 / 2 秒交还 / 接续
 └── README.md
 ```
 
@@ -86,6 +90,43 @@ python3 -m aerial --base-url http://127.0.0.1:8080 --workdir ./data incremental
 水位取“**本次扫描启动那一刻**”的站点时间：扫描期间才生效、但本次未采到的更新，
 下一次增量仍会被复查，不会被水位永久跳过。
 
+## 三·五、采集会话（并行、独立停止、接续）
+
+全量与增量在内部统一为**采集会话**（`aerial.session.Session`），命令行也走同一套
+会话。一个会话 = 一个工作目录 + 一个模式（full / incremental）：
+
+```python
+from aerial.config import Config
+from aerial.session import SessionManager
+
+manager = SessionManager()                     # 站点 → 共享限流器
+a = manager.create(Config(base_url=url_a, workdir=Path("./a")), "full").start()
+b = manager.create(Config(base_url=url_b, workdir=Path("./b")), "full").start()
+
+a.stop(timeout=2.0)     # 2 秒内停 a：之后 a 不再发请求、不再写文件
+b.join()                # b 不受影响，继续采完
+```
+
+关键保证：
+
+- **同进程并行**：每个会话占用独立工作目录与独立取消令牌；**同一站点**上的多个
+  会话共享该站点的最小发起间隔与 503 统一暂停（站点口径），不同站点各有各的
+  限流器，互不干扰。
+- **2 秒内独立停止**：`Session.stop(timeout=2.0)` 依次做
+  `取消令牌 → 叫醒所有阻塞 → 关闭在途 socket → 合上写门闩并等待在途写入 →
+  交还工作目录锁`。无论是**等目录响应**、**处于站点暂停**还是**正在读影像响应体**，
+  都会立刻被打断；返回时工作目录锁已交还，另一会话可立即占用。
+- **停采后沉默**：返回后该会话**不再发出任何请求**（请求前都查令牌），
+  **不再写任何文件**（所有写动作走写门闩，合上后写入抛 `Cancelled`）。
+- **接续采**：停止不保存扫描水位（那也是一次写），保留已 fsync 的区段与已提交的
+  清单；用**原工作目录**重新启动，按“区段文件名 + 期望长度”复用已落盘区段、只补
+  缺档。清单里始终只有**完整且 sha256 校验通过**的影像。
+- **命令行同样可停**：`python -m aerial ...` 前台运行一个会话，`SIGINT` / `SIGTERM`
+  触发优雅停采（退出码 `130`），同样在 2 秒内交还工作目录。
+
+`Session.wait(timeout)` 可在不停止的前提下等待自然结束，返回退出码
+（`0` 完成 / `2` 仍有待补齐 / `130` 已被停止）。
+
 ## 四、工作目录与产物
 
 ```
@@ -134,6 +175,23 @@ python3 verify.py --workdir ./verify_data --keep
 
 验证脚本内部会：全量下载中 `SIGKILL` 强杀 → 同目录续采并断言“复用 N 段” →
 等到补登条目与换版生效后跑增量 → 对所有当前影像重新计算 sha256 比对。
+
+## 五·五、会话级端到端验证（停采 / 并行 / 接续）
+
+```bash
+python3 verify_sessions.py            # 约 55 秒，自动端口与临时目录
+python3 verify_sessions.py --keep     # 保留现场
+```
+
+在同一进程内起两个互不干扰的模拟站，逐条断言：
+
+- **等待目录响应时停采**：`stop()` 在 2 秒内返回、目录锁已交还、之后零请求零写入；
+- **站点统一暂停（503 + Retry-After=30）时停采**：同上，不被长暂停拖住；
+- **等待影像响应体时停采**：同上，正在读的那一段也不会再落盘；
+- **两站并行隔离**：A 站阻塞在响应体时 B 站照常推进；只停 A，B 继续并正常结束；
+- **原目录接续**：被停会话在原工作目录重启，日志显示“复用 N 段”，被中断的卷宗
+  补全入库，清单每卷 sha256 / 大小均通过、且只指向完整影像；
+- **命令行走会话**：`python -m aerial` + `SIGTERM` 在 2 秒左右退出、交还目录、停后沉默。
 
 ## 六、运行单元测试
 

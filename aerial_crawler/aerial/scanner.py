@@ -1,15 +1,20 @@
-"""全量 / 增量采集调度。
+"""全量 / 增量采集调度引擎（可取消）。
 
 扫描流程：
 1. 从 /catalog 开始逐页解析目录（目录按更新时间倒序、可能有重复链接）；
 2. 全量模式：每个卷宗取一个链接进详情；
    增量模式：只进“上次扫描水位之后的更新”与“仍可能补登的范围”
-   （站点当前时间 - backfill_seconds 地平线以内）的卷宗，已知卷宗整体落在
-   地平线之外的页面可提前停止翻页；
+   （站点当前时间 - backfill_seconds 地平线以内）的卷宗；
 3. worker 线程池并发处理详情与下载，全部请求共用一个限流器；
-4. 临时失败进持久化 FailedQueue，主扫描结束后跑补齐轮次（含目录首页复查，
-   专门兜住“最迟在更新时间后 10 分钟补登”的条目）；
-5. 每轮结束保存扫描水位；强制 kill 后用同一工作目录重跑即可续采。
+4. 临时失败进持久化 FailedQueue，主扫描结束后跑补齐轮次（含目录首页复查）；
+5. 每轮结束保存扫描水位；强制 kill 或用同一工作目录重跑即可续采。
+
+会话取消（``CancelToken``）：
+- 每一次阻塞（限流等待、退避、队列等待、补齐轮次等待、HTTP 读写）都检查
+  令牌；取消后立即抛 ``Cancelled``，不再发请求、不再写文件；
+- 所有写动作走 ``token.writing()`` 门闩；取消并合上闩后写入被拒绝；
+- 取消时不会保存扫描水位（那是一次写），已落盘的区段与已提交的清单保留，
+  重开同一工作目录即可复用区段续采。
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from .cancel import CancelToken, Cancelled
 from .config import Config
 from .downloader import ImageDownloader
 from .http import Client, PermanentHTTPError, TransientHTTPError
@@ -32,6 +38,11 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 8  # 单个卷宗跨进程的最大尝试次数，超过则留在失败队列人工处理
 
+# 退出码
+EXIT_OK = 0
+EXIT_PENDING = 2
+EXIT_CANCELLED = 130
+
 
 @dataclass
 class Job:
@@ -43,18 +54,27 @@ class Job:
 
 
 class Scanner:
-    def __init__(self, cfg: Config, workdir: WorkDir, mode: str) -> None:
+    def __init__(self, cfg: Config, workdir: WorkDir, mode: str,
+                 token: Optional[CancelToken] = None,
+                 limiter: Optional[RateLimiter] = None,
+                 client: Optional[Client] = None,
+                 manifest: Optional[Manifest] = None,
+                 downloader: Optional[ImageDownloader] = None,
+                 failed: Optional[FailedQueue] = None) -> None:
         if mode not in ("full", "incremental"):
             raise ValueError("mode 只能是 full / incremental")
         self.cfg = cfg
         self.wd = workdir
         self.mode = mode
-        self.limiter = RateLimiter(cfg.min_interval)
-        self.client = Client(cfg, self.limiter)
-        self.manifest = Manifest(workdir.events_file, workdir.current_file)
-        self.downloader = ImageDownloader(cfg, self.client, self.manifest)
+        self.token = token or CancelToken()
+        self.limiter = limiter or RateLimiter(cfg.min_interval)
+        self.client = client or Client(cfg, self.limiter, self.token)
+        self.manifest = manifest or Manifest(workdir.events_file,
+                                             workdir.current_file, self.token)
+        self.downloader = downloader or ImageDownloader(
+            cfg, self.client, self.manifest, self.token)
         self.state = ScanState.load(workdir.state_file)
-        self.failed = FailedQueue(workdir.failed_file)
+        self.failed = failed or FailedQueue(workdir.failed_file, self.token)
 
         self.jobs: "queue.Queue[Optional[Job]]" = queue.Queue()
         self._inflight: set[str] = set()
@@ -64,16 +84,27 @@ class Scanner:
         self.max_site_time: Optional[int] = self.state.last_scan_site_time
         # 本次扫描启动那一刻的站点时间（用作持久化水位）
         self._scan_start_site_time: Optional[int] = None
-        self.stop_event = threading.Event()
         # 主扫描是否遇到过空目录（条目可能尚未补登，需继续复查）
         self._catalog_was_empty = False
         self._empty_seen_site_time: Optional[int] = None
         # 最近一次目录复查时的站点时间，用于限定补登等待上限
         self._last_recheck_site_time: Optional[int] = None
+        self._workers: list[threading.Thread] = []
+        self._finished = False
 
     # ------------------------------------------------------------------ #
     def run(self) -> int:
         log.info("==== 开始 %s 采集，工作目录 %s ====", self.mode, self.cfg.workdir)
+        try:
+            self._run_inner()
+        except Cancelled:
+            log.warning("会话被停止：不再发请求/写文件，已落盘的区段可用于续采")
+            return EXIT_CANCELLED
+        finally:
+            self._stop_workers()
+        return self._exit_code()
+
+    def _run_inner(self) -> None:
         # 上次未补齐的卷宗先入队
         for item in self.failed.all():
             self._enqueue(Job(item.volume_id, item.href or f"/volumes/{item.volume_id}",
@@ -81,20 +112,14 @@ class Scanner:
 
         horizon = self._scan_catalog()
 
-        # 主扫描 worker 池（守护线程，队列 join 后随进程退出）
+        # 主扫描 worker 池（守护线程）
         self._start_workers()
-        self.jobs.join()
+        self._wait_jobs()
 
         # 补齐轮次：失败重试 + 补登复查。
-        # 继续条件（满足其一）：
-        #   a) 失败队列非空（有卷宗要重试）；
-        #   b) 主扫描遇到过空目录，或最近一次复查时站点时间仍落在
-        #      “补登地平线 + 一个窗口”之内——迟到条目最迟在更新时间后
-        #      backfill_seconds 内补登，必须持续复查到窗口走完。
         for round_no in range(1, self.cfg.retry_rounds + 1):
-            if self.stop_event.is_set():
-                break
-            time.sleep(self.cfg.retry_round_interval)
+            self.token.check()
+            self.token.sleep(self.cfg.retry_round_interval)
             found_new = self._recheck_catalog(horizon)
             pending = self.failed.all()
             if not pending and not self._should_keep_waiting():
@@ -109,20 +134,26 @@ class Scanner:
                     self._enqueue(Job(item.volume_id,
                                       item.href or f"/volumes/{item.volume_id}",
                                       item.updated_at, item.attempts))
-                self.jobs.join()
+                self._wait_jobs()
 
         # 保存扫描水位：用“扫描启动时刻”而非结束时刻，保证扫描期间生效、
         # 但本次未采到的更新，下一次增量仍会被复查（不会被水位跳过）。
+        self.token.check()
+        self._finished = True
         if self._scan_start_site_time is not None:
             self.state.last_scan_site_time = self._scan_start_site_time
         self.state.mode = self.mode
-        self.state.save(self.wd.state_file)
+        self.state.save(self.wd.state_file, token=self.token)
 
         remaining = len(self.failed)
         log.info("==== %s 采集结束：清单 %d 卷，待补齐 %d 卷，限流统计 %s ====",
                  self.mode, self.manifest.volume_count(), remaining,
                  self.limiter.snapshot())
-        return 0 if remaining == 0 else 2
+
+    def _exit_code(self) -> int:
+        if self.token.cancelled:
+            return EXIT_CANCELLED
+        return EXIT_OK if len(self.failed) == 0 else EXIT_PENDING
 
     # ------------------------------------------------------------------ #
     def _start_workers(self) -> None:
@@ -130,24 +161,52 @@ class Scanner:
             t = threading.Thread(target=self._worker_loop, name=f"worker-{i}",
                                  daemon=True)
             t.start()
+            self._workers.append(t)
+
+    def _stop_workers(self) -> None:
+        """唤醒并等待 worker 退出；不阻塞取消路径太久。"""
+        for _ in self._workers:
+            self.jobs.put(None)
+        deadline = time.monotonic() + 1.0
+        for t in self._workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
 
     def _worker_loop(self) -> None:
         while True:
-            job = self.jobs.get()
+            if self.token.cancelled:
+                return
+            try:
+                job = self.jobs.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if job is None:  # 哨兵：停机
+                self.jobs.task_done()
+                return
             try:
                 self._process_job(job)
+            except Cancelled:
+                return
             except Exception:  # noqa: BLE001 - worker 不能因单卷异常整体退出
                 log.exception("处理卷宗 %s 时出现未预期异常", job.volume_id)
-                self._mark_failed(job, "未预期异常")
+                try:
+                    self._mark_failed(job, "未预期异常")
+                except Cancelled:
+                    return
             finally:
                 with self._inflight_lock:
                     self._inflight.discard(job.volume_id)
                 self.jobs.task_done()
 
     def _process_job(self, job: Job) -> None:
+        self.token.check()
         vid = job.volume_id
         try:
             detail = self._fetch_detail(job)
+        except Cancelled:
+            raise
         except PermanentHTTPError as exc:
             if exc.status == 404:
                 # 目录已出现但详情还没开放：补登窗口内按临时失败处理
@@ -164,6 +223,8 @@ class Scanner:
 
         try:
             self.downloader.download(detail)
+        except Cancelled:
+            raise
         except TransientHTTPError as exc:
             self._mark_failed(job, f"影像下载临时故障: {exc}", detail=detail)
             self.manifest.record_failure(vid, detail, str(exc))
@@ -185,7 +246,8 @@ class Scanner:
         url: Optional[str] = "/catalog"
         page_no = 0
         horizon: Optional[int] = None
-        while url is not None and not self.stop_event.is_set():
+        while url is not None:
+            self.token.check()
             page_no += 1
             resp = self.client.get(url)
             self._note_site_time(resp.site_time)
@@ -200,9 +262,6 @@ class Scanner:
                 self._empty_seen_site_time = resp.site_time
                 log.info("第 %d 页目录为空，条目可能尚未补登，稍后复查", page_no)
 
-            # 注：不在此处按“整页均为旧卷宗”提前停止翻页。目录按更新时间倒序，
-            # 但换版条目会插到前部页面、补登条目位置不定，提前停止会漏掉它们；
-            # 增量的范围裁剪统一由 _consider_entry 的水位 / 地平线规则负责。
             for entry in page.entries:
                 self._consider_entry(entry, horizon)
             url = page.next_page
@@ -211,13 +270,6 @@ class Scanner:
         return horizon
 
     def _should_keep_waiting(self) -> bool:
-        """是否还要继续复查目录等待补登。
-
-        依据站点时钟与补登窗口判定：只要“当前站点时间 - 补登窗口”仍晚于
-        首次观察到空目录的时刻，就说明该时刻之后更新的条目仍处于可能补登
-        的范围内，必须继续复查。窗口走完且失败队列为空才可停止。
-        未观察到空目录的常规扫描不等待。
-        """
         if not self._catalog_was_empty:
             return False
         if self._empty_seen_site_time is None or \
@@ -227,15 +279,13 @@ class Scanner:
         return horizon_now <= self._empty_seen_site_time
 
     def _recheck_catalog(self, horizon: Optional[int]) -> bool:
-        """补齐轮次中完整重翻目录，捞取晚补登 / 换版的条目。
-
-        不能只看首页：补登条目可能出现在后续分页。返回是否发现新候选。
-        """
+        """补齐轮次中完整重翻目录，捞取晚补登 / 换版的条目。"""
         before = len({k[0] for k in self._seen_catalog})
         url: Optional[str] = "/catalog"
         page_no = 0
         try:
             while url is not None:
+                self.token.check()
                 page_no += 1
                 resp = self.client.get(url)
                 self._note_site_time(resp.site_time)
@@ -258,16 +308,12 @@ class Scanner:
         vid = entry.volume_id
         if self.mode == "incremental":
             known = vid in self.state.known_volumes
-            # 已知卷宗只看水位之后的更新；未知卷宗在地平线内才值得查
-            # （地平线之外的未知条目说明其更新时间太旧，不会再补登）
             if known:
                 if self.state.last_scan_site_time is not None and \
                         entry.updated_at <= self.state.last_scan_site_time:
                     return
             elif horizon is not None and entry.updated_at < horizon:
                 return
-        # 去重键含更新时间：同一卷同一版本的重复链接只入队一次，
-        # 但复查时发现的换版（updated_at 变大）会作为新任务入队
         dedup_key = (vid, entry.updated_at)
         if dedup_key in self._seen_catalog:
             log.info("目录重复链接已忽略: %s updated_at=%s（%s）",
@@ -291,11 +337,23 @@ class Scanner:
 
     # ------------------------------------------------------------------ #
     def _enqueue(self, job: Job) -> None:
+        self.token.check()
         with self._inflight_lock:
             if job.volume_id in self._inflight:
                 return
             self._inflight.add(job.volume_id)
         self.jobs.put(job)
+
+    def _wait_jobs(self) -> None:
+        """可取消地等待队列内任务全部完成。"""
+        while True:
+            self.token.check()
+            if self.jobs.unfinished_tasks == 0:
+                # 可能仍有 worker 正在把刚完成的任务标记为 done，再确认一次
+                time.sleep(0)  # 让出
+                if self.jobs.unfinished_tasks == 0:
+                    return
+            self.token.sleep(0.01)
 
     def _mark_failed(self, job: Job, reason: str,
                      detail: Optional[VolumeDetail] = None) -> None:

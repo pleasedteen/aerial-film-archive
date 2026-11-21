@@ -7,6 +7,12 @@
 - 全部区段到齐后流式拼接并计算 sha256，校验通过才原子替换为完整影像；
 - 同一卷宗的不同版本使用独立区段目录与最终文件名，互不覆盖；
 - 同一 (卷宗, 版本) 的在途任务由 scanner 去重，保证只拉一份完整影像。
+
+会话停止：
+- 每个写动作（区段落盘、拼接临时文件、原子改名、清理区段目录）都在
+  ``token.writing()`` 门闩内；停止后立即抛 Cancelled，不会写文件；
+- 下载中途被停止时，已 fsync 的区段保留在 chunks/ 下，原目录再启动会按
+  长度校验复用，只补缺档。
 """
 from __future__ import annotations
 
@@ -16,7 +22,9 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from typing import Optional
 
+from .cancel import CancelToken, Cancelled
 from .config import Config
 from .http import Client, PermanentHTTPError, TransientHTTPError
 from .manifest import Manifest
@@ -30,15 +38,30 @@ class ChecksumMismatch(TransientHTTPError):
 
 
 class ImageDownloader:
-    def __init__(self, cfg: Config, client: Client, manifest: Manifest) -> None:
+    def __init__(self, cfg: Config, client: Client, manifest: Manifest,
+                 token: Optional[CancelToken] = None) -> None:
         self.cfg = cfg
         self.client = client
         self.manifest = manifest
+        self.token = token
 
     # ------------------------------------------------------------------ #
+    def _check(self) -> None:
+        if self.token is not None:
+            self.token.check()
+
+    def _writing(self):
+        """写门闩上下文：无令牌时为空操作。"""
+        if self.token is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        return self.token.writing()
+
     def _volume_dir(self, vid: str) -> Path:
+        self._check()
         d = self.cfg.images_dir / vid
-        d.mkdir(parents=True, exist_ok=True)
+        with self._writing():
+            d.mkdir(parents=True, exist_ok=True)
         return d
 
     def _final_path(self, detail: VolumeDetail) -> Path:
@@ -55,14 +78,16 @@ class ImageDownloader:
         if not chunks_root.exists():
             return
         keep = self._chunks_dir(detail).name
-        for child in chunks_root.iterdir():
-            if child.is_dir() and child.name != keep:
-                shutil.rmtree(child, ignore_errors=True)
-                log.info("清理过期区段目录 %s", child)
+        with self._writing():
+            for child in chunks_root.iterdir():
+                if child.is_dir() and child.name != keep:
+                    shutil.rmtree(child, ignore_errors=True)
+                    log.info("清理过期区段目录 %s", child)
 
     # ------------------------------------------------------------------ #
     def download(self, detail: VolumeDetail) -> Path:
         """下载并校验，返回完整影像路径。失败抛 TransientHTTPError。"""
+        self._check()
         vid = detail.volume_id
         final = self._final_path(detail)
 
@@ -92,7 +117,8 @@ class ImageDownloader:
 
         self._cleanup_stale_chunk_dirs(detail)
         chunks_dir = self._chunks_dir(detail)
-        chunks_dir.mkdir(parents=True, exist_ok=True)
+        with self._writing():
+            chunks_dir.mkdir(parents=True, exist_ok=True)
 
         chunk_size = self.cfg.chunk_size
         boundaries = list(range(0, total, chunk_size))
@@ -101,6 +127,7 @@ class ImageDownloader:
 
         # 3) 逐段下载；已落盘且长度正确的区段直接复用
         for index, start in enumerate(boundaries):
+            self._check()
             end = min(start + chunk_size, total)
             chunk_path = chunks_dir / f"chunk_{index:06d}"
             expected_len = end - start
@@ -112,6 +139,7 @@ class ImageDownloader:
             self._fetch_one_chunk(detail, chunk_path, start, end, index)
             fetched_count += 1
 
+        self._check()
         log.info(
             "卷宗 %s v%s 区段齐了（复用 %d 段，新拉 %d 段），开始拼接校验",
             vid, detail.version, reused_count, fetched_count,
@@ -120,29 +148,32 @@ class ImageDownloader:
         # 4) 流式拼接 + sha256，通过后原子落地完整影像
         assembled = final.with_suffix(".img.assembling")
         digest = hashlib.sha256()
-        try:
-            with open(assembled, "wb") as out:
-                for index in range(len(boundaries)):
-                    chunk_path = chunks_dir / f"chunk_{index:06d}"
-                    with open(chunk_path, "rb") as src:
-                        for block in iter(lambda: src.read(1024 * 1024), b""):
-                            out.write(block)
-                            digest.update(block)
-                    out.flush()
-                os.fsync(out.fileno())
-            actual = digest.hexdigest()
-            if actual != detail.checksum:
-                raise ChecksumMismatch(
-                    f"卷宗 {vid} 校验失败: 期望 {detail.checksum} 实际 {actual}"
-                )
-            os.replace(assembled, final)
-        finally:
-            if assembled.exists():
-                assembled.unlink()
+        with self._writing():
+            try:
+                with open(assembled, "wb") as out:
+                    for index in range(len(boundaries)):
+                        self._check()
+                        chunk_path = chunks_dir / f"chunk_{index:06d}"
+                        with open(chunk_path, "rb") as src:
+                            for block in iter(lambda: src.read(1024 * 1024), b""):
+                                out.write(block)
+                                digest.update(block)
+                        out.flush()
+                    os.fsync(out.fileno())
+                actual = digest.hexdigest()
+                if actual != detail.checksum:
+                    raise ChecksumMismatch(
+                        f"卷宗 {vid} 校验失败: 期望 {detail.checksum} 实际 {actual}"
+                    )
+                os.replace(assembled, final)
+            finally:
+                if assembled.exists():
+                    assembled.unlink()
 
         # 5) 提交清单（含单调保护），随后清理区段目录
         result = self.manifest.commit_image(detail, final)
-        shutil.rmtree(chunks_dir, ignore_errors=True)
+        with self._writing():
+            shutil.rmtree(chunks_dir, ignore_errors=True)
         log.info(
             "卷宗 %s v%s 影像校验通过并提交清单（%s）: %s",
             vid, detail.version, result, final,
@@ -154,6 +185,7 @@ class ImageDownloader:
         self, detail: VolumeDetail, chunk_path: Path,
         start: int, end: int, index: int,
     ) -> None:
+        self._check()
         url = detail.image_href
         tmp = chunk_path.with_suffix(".part")
         # Range 头是闭区间，而内部 end 为排他上界，需减 1
@@ -166,6 +198,8 @@ class ImageDownloader:
                 raise TransientHTTPError(
                     f"卷宗 {detail.volume_id} 影像暂不可用(404)，等待补登"
                 ) from exc
+            raise
+        except Cancelled:
             raise
 
         if resp.status == 206:
@@ -188,15 +222,18 @@ class ImageDownloader:
             )
 
         # 立即持久化：tmp + fsync + 原子改名，kill -9 后要么没有要么完整
-        with open(tmp, "wb") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, chunk_path)
+        with self._writing():
+            with open(tmp, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, chunk_path)
 
     def _probe_size(self, detail: VolumeDetail) -> int:
         try:
             return self.client.head_size(detail.image_href)
+        except Cancelled:
+            raise
         except TransientHTTPError:
             raise
         except http.client.HTTPException as exc:

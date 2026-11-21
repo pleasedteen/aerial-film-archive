@@ -1,4 +1,15 @@
-"""模拟站 HTTP 服务：分页目录、卷宗详情、支持 Range 的影像下载。"""
+"""模拟站 HTTP 服务：分页目录、卷宗详情、支持 Range 的影像下载。
+
+除了原有的路由与故障注入，还提供 ``ServerControl`` 供验证脚本做“停采”
+实验：
+- 记录每个请求的到达时刻（用于断言停采后不再有新请求）；
+- 可挂起目录响应（客户端阻塞在等响应头）；
+- 可挂起影像响应体（发完响应头后分两段写，客户端阻塞在读 body）；
+- 可强制返回一次 503 + 长 Retry-After（客户端阻塞在统一暂停里）。
+
+每个 server 实例使用自己的 Handler 子类，因此同一进程内可以同时起多个
+互不干扰的模拟站（用于验证“另一站采集不受影响”）。
+"""
 from __future__ import annotations
 
 import logging
@@ -39,12 +50,104 @@ class _RateWindow:
             return True
 
 
+class ServerControl:
+    """验证用的请求观测与阻塞控制。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._arrivals: list[tuple[float, str]] = []
+        # 目录响应门：默认放行；hold 后服务端在发响应前阻塞
+        self._catalog_gate = threading.Event()
+        self._catalog_gate.set()
+        # 影像响应体门：默认放行
+        self._image_gate = threading.Event()
+        self._image_gate.set()
+        self._image_hold: tuple[int, int] | None = None  # (nth, after_bytes)
+        self._image_seen = 0
+        self.image_hold_claimed = threading.Event()
+        # 强制状态响应
+        self._forced: list[dict] = []
+
+    # -- 请求记录 -------------------------------------------------------- #
+    def record_arrival(self, path: str) -> None:
+        with self._lock:
+            self._arrivals.append((time.monotonic(), path))
+
+    def request_count(self, prefix: str = "") -> int:
+        with self._lock:
+            return sum(1 for _, p in self._arrivals if p.startswith(prefix))
+
+    # -- 目录响应挂起 ---------------------------------------------------- #
+    def hold_catalog(self) -> None:
+        self._catalog_gate.clear()
+
+    def release_catalog(self) -> None:
+        self._catalog_gate.set()
+
+    def wait_catalog(self, timeout: float = 30.0) -> None:
+        self._catalog_gate.wait(timeout)
+
+    # -- 影像响应体挂起 -------------------------------------------------- #
+    def arm_image_body_hold(self, after_bytes: int = 4096, nth: int = 1) -> None:
+        """让第 nth 个数据响应先写 after_bytes 再挂起，直到 release。"""
+        with self._lock:
+            self._image_hold = (nth, after_bytes)
+            self._image_seen = 0
+        self.image_hold_claimed.clear()
+        self._image_gate.clear()
+
+    def release_image_body(self) -> None:
+        self._image_gate.set()
+
+    def claim_image_body(self, total: int):
+        """若本次数据响应应被挂起，返回 (after_bytes, gate)。
+
+        总长度不超过 after_bytes 的小响应（如 Range 探测 bytes=0-0）不计数、
+        不挂起，保证挂起落在真正的数据段上。
+        """
+        with self._lock:
+            if self._image_hold is None:
+                return None
+            nth, after = self._image_hold
+            if after >= total:
+                return None
+            self._image_seen += 1
+            if self._image_seen != nth:
+                return None
+            self._image_hold = None
+            self.image_hold_claimed.set()
+            return after, self._image_gate
+
+    # -- 强制 503 -------------------------------------------------------- #
+    def force_status(self, prefix: str, status: int, retry_after: float,
+                     times: int = 1) -> None:
+        with self._lock:
+            self._forced.append({
+                "prefix": prefix, "status": status,
+                "retry_after": retry_after, "remaining": times,
+            })
+
+    def take_forced(self, path: str):
+        with self._lock:
+            for item in self._forced:
+                if item["remaining"] > 0 and path.startswith(item["prefix"]):
+                    item["remaining"] -= 1
+                    return item["status"], item["retry_after"]
+        return None
+
+    # -- 收尾 ------------------------------------------------------------ #
+    def release_all(self) -> None:
+        self._catalog_gate.set()
+        self._image_gate.set()
+
+
 class MockHandler(BaseHTTPRequestHandler):
     server_version = "MockArchive/1.0"
 
-    # 由 server 实例注入
+    # 由 build_server 注入（每个 server 用独立子类，互不干扰）
     scenario: Scenario
     rate_window: _RateWindow
+    control: ServerControl
     real_start: float
 
     # ------------------------------------------------------------------ #
@@ -56,7 +159,8 @@ class MockHandler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, body: bytes = b"",
               content_type: str = "text/html; charset=utf-8",
-              extra_headers: dict[str, str] | None = None) -> None:
+              extra_headers: dict[str, str] | None = None,
+              body_gate=None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -65,13 +169,46 @@ class MockHandler(BaseHTTPRequestHandler):
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        if self.command != "HEAD":
+        if self.command == "HEAD":
+            return
+        if body_gate is not None:
+            after, gate = body_gate
+            try:
+                self.wfile.write(body[:after])
+                self.wfile.flush()
+            except OSError:
+                return
+            gate.wait(timeout=30)
+            try:
+                self.wfile.write(body[after:])
+                self.wfile.flush()
+            except OSError:
+                # 客户端停采已关闭连接
+                pass
+            return
+        try:
             self.wfile.write(body)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ #
     def do_GET(self) -> None:  # noqa: N802
         parts = urlsplit(self.path)
         path = parts.path
+
+        if path != "/healthz":
+            self.control.record_arrival(path)
+
+        # 强制的 503（站点统一暂停），优先于限流窗口，保证可回放
+        forced = self.control.take_forced(path) if path != "/healthz" else None
+        if forced is not None:
+            status, retry_after = forced
+            self._send(
+                status, b"<html><body>slow down</body></html>",
+                extra_headers={"Retry-After": str(retry_after)},
+            )
+            log.warning("强制返回 %s Retry-After=%s（%s）", status, retry_after, path)
+            return
 
         # 全局限流（健康检查除外）
         if path != "/healthz" and not self.rate_window.allow():
@@ -86,6 +223,8 @@ class MockHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send(200, b"ok", "text/plain")
         elif path == "/catalog":
+            # 验证“等待目录响应时停采”：发响应前阻塞
+            self.control.wait_catalog()
             self._handle_catalog(parse_qs(parts.query))
         elif path.startswith("/volumes/"):
             self._handle_detail(path.rsplit("/", 1)[-1])
@@ -200,7 +339,8 @@ class MockHandler(BaseHTTPRequestHandler):
         total = len(data)
         range_header = self.headers.get("Range")
         if not range_header:
-            self._send(200, data, "application/octet-stream")
+            plan = self.control.claim_image_body(total)
+            self._send(200, data, "application/octet-stream", body_gate=plan)
             return
 
         match = RANGE_RE.fullmatch(range_header.strip())
@@ -220,6 +360,7 @@ class MockHandler(BaseHTTPRequestHandler):
             return
         end = min(end, total - 1)
         body = data[start:end + 1]
+        plan = self.control.claim_image_body(len(body))
         self._send(
             206,
             body,
@@ -227,21 +368,33 @@ class MockHandler(BaseHTTPRequestHandler):
             extra_headers={
                 "Content-Range": f"bytes {start}-{end}/{total}",
             },
+            body_gate=plan,
         )
 
 
 def build_server(host: str, port: int, rate: int) -> ThreadingHTTPServer:
     scenario = Scenario(rate=rate)
     rate_window = _RateWindow(RATE_LIMIT_PER_SECOND)
+    control = ServerControl()
     real_start = time.monotonic()
 
-    handler = MockHandler
-    handler.scenario = scenario
-    handler.rate_window = rate_window
-    handler.real_start = real_start
+    # 每个 server 使用自己的 Handler 子类，避免多站互相覆盖类属性
+    handler = type(
+        "MockHandler_" + str(id(scenario)),
+        (MockHandler,),
+        {
+            "scenario": scenario,
+            "rate_window": rate_window,
+            "control": control,
+            "real_start": real_start,
+        },
+    )
 
     server = ThreadingHTTPServer((host, port), handler)
     server.scenario = scenario            # type: ignore[attr-defined]
     server.rate_window = rate_window      # type: ignore[attr-defined]
+    server.control = control              # type: ignore[attr-defined]
+    server.real_start = real_start        # type: ignore[attr-defined]
     server.daemon_threads = True
     return server
+

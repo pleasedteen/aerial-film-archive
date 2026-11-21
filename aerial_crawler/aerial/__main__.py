@@ -3,16 +3,24 @@
 用法：
   python -m aerial --base-url http://127.0.0.1:8080 --workdir ./data full
   python -m aerial --base-url http://127.0.0.1:8080 --workdir ./data incremental
+
+命令行同样走 Session：
+- 前台运行一个会话，SIGINT（Ctrl-C）/ SIGTERM 触发“优雅停采”：
+  在 2 秒内交还工作目录，之后不再发请求、不再写文件；
+- 停止时保留已 fsync 的区段与已提交的清单，用原工作目录再启动即可续采。
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
 from .config import Config
-from .scanner import Scanner
+from .session import Session, SessionConflict, SessionManager
 from .state import WorkDir
 
 
@@ -31,6 +39,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--retry-round-interval", type=float, default=1.0,
                    help="补齐轮之间的等待秒数")
     p.add_argument("--max-retries", type=int, default=6, help="单请求最大重试次数")
+    p.add_argument("--stop-timeout", type=float, default=2.0,
+                   help="收到停止信号后交还工作目录的时限（秒）")
     p.add_argument("positional_mode", nargs="?", choices=("full", "incremental"))
     return p.parse_args(argv)
 
@@ -68,20 +78,41 @@ def main(argv: list[str] | None = None) -> int:
     wd = WorkDir(cfg.workdir)
     setup_logging(wd.log_dir)
     log = logging.getLogger("aerial")
-    try:
-        wd.acquire_lock()
-    except RuntimeError as exc:
-        log.error("%s", exc)
-        return 73  # EX_CANTCREAT 类：资源占用
 
+    manager = SessionManager()
+    session = manager.create(cfg, mode)
+    stop_requested = threading.Event()
+
+    # 信号 → 优雅停采（在信号处理里完成，主线程只等待结果）
+    def _on_signal(signum, _frame) -> None:
+        log.warning("收到信号 %s，开始优雅停采（≤ %.1f 秒交还工作目录）",
+                    signum, args.stop_timeout)
+        stop_requested.set()
+        session.stop(timeout=args.stop_timeout)
+
+    old_int = signal.signal(signal.SIGINT, _on_signal)
+    old_term = signal.signal(signal.SIGTERM, _on_signal)
     try:
-        scanner = Scanner(cfg, wd, mode)
-        return scanner.run()
-    except KeyboardInterrupt:
-        log.warning("收到中断信号，已落盘的区段和清单可用于续采")
-        return 130
+        try:
+            session.start()
+        except SessionConflict as exc:
+            log.error("%s", exc)
+            return 73  # EX_CANTCREAT 类：资源占用
+        # 不用无超时的 join：即使工作线程迟迟未退，收到停止信号后也要能返回
+        stop_deadline = None
+        while True:
+            result = session.wait(0.2)
+            if result is not None:
+                return result
+            if stop_requested.is_set():
+                if stop_deadline is None:
+                    stop_deadline = time.monotonic() + args.stop_timeout + 2.0
+                if not session.running or time.monotonic() >= stop_deadline:
+                    # stop() 已交还工作目录锁；线程是守护线程，进程退出不阻塞
+                    return 130
     finally:
-        wd.release_lock()
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
 
 
 if __name__ == "__main__":

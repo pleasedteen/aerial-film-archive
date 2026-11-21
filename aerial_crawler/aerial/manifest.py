@@ -7,6 +7,11 @@
 2. current.json —— {volume_id: 当前条目} 的原子替换视图。
    每个卷宗始终只有一个当前条目，且只在校验通过后才切换；
    “较晚完成的旧版下载”无法让清单回退（版本号/更新时间单调保护）。
+
+会话停止：
+- 所有读写都受 CancelToken 的写入门闩保护；停止后写入抛 Cancelled。
+- 清单只发完整且校验通过的影像：commit_image 是唯一写当前条目的入口，
+  且只在下载器完成 sha256 校验后调用。
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from .cancel import CancelToken
 from .parsing import VolumeDetail
 from .state import atomic_write_text
 
@@ -29,23 +35,42 @@ EV_REUSED = "reused"              # 续采时复用已校验通过的完整影�
 
 
 class Manifest:
-    def __init__(self, events_file: Path, current_file: Path) -> None:
+    def __init__(self, events_file: Path, current_file: Path,
+                 token: Optional[CancelToken] = None) -> None:
         self.events_file = events_file
         self.current_file = current_file
+        self.token = token
         self._lock = threading.Lock()
         self._current: dict[str, dict] = {}
         if current_file.exists():
             self._current = json.loads(current_file.read_text(encoding="utf-8"))
         if not events_file.exists():
-            events_file.touch()
+            self._touch_events()
+
+    def _touch_events(self) -> None:
+        if self.token is not None:
+            with self.token.writing():
+                self.events_file.parent.mkdir(parents=True, exist_ok=True)
+                self.events_file.touch()
+        else:
+            self.events_file.parent.mkdir(parents=True, exist_ok=True)
+            self.events_file.touch()
 
     # ------------------------------------------------------------------ #
     def _append_event(self, event: dict) -> None:
         line = json.dumps(event, ensure_ascii=False, sort_keys=True)
-        with open(self.events_file, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+
+        def _do() -> None:
+            with open(self.events_file, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+
+        if self.token is not None:
+            with self.token.writing():
+                _do()
+        else:
+            _do()
 
     def record_discovered(self, detail: VolumeDetail) -> None:
         with self._lock:
@@ -140,6 +165,7 @@ class Manifest:
         atomic_write_text(
             self.current_file,
             json.dumps(self._current, ensure_ascii=False, indent=2, sort_keys=True),
+            token=self.token,
         )
 
     # ------------------------------------------------------------------ #
