@@ -14,12 +14,14 @@ aerial_crawler/
 │   ├── parsing.py         # 分页目录与卷宗详情 HTML 解析
 │   ├── state.py           # 工作目录状态（水位、失败队列、单实例锁、原子写）
 │   ├── manifest.py        # JSON Lines 事件清单 + 每卷当前条目原子视图
+│   ├── diagnose.py        # 续采诊断：分段请求诊断流 + 只读诊断报告（不取写锁）
 │   ├── downloader.py      # 分段下载、断点区段复用、sha256 校验装配
 │   └── scanner.py         # 全量 / 增量采集调度、worker 池、补齐轮次
 ├── mocksite/              # 可回放的 HTTP 模拟站
 │   ├── scenario.py        # 固定场景与 20 倍速虚拟站点时钟
 │   └── server.py          # 分页目录 / 详情 / Range 影像 / 故障注入 / 限流
 ├── tests/test_rules.py    # 规则级单元测试（unittest）
+├── tests/test_diagnose.py # 续采诊断单元测试（强杀未知、换版归属、复用回溯）
 ├── verify.py              # 一条命令的端到端验证（80 秒内出可读报告）
 └── README.md
 ```
@@ -95,8 +97,9 @@ data/
 │   ├── failed.json     # 待补齐卷宗及尝试次数（原子写，清空时可能不存在）
 │   └── lock            # 单实例文件锁
 ├── manifest/
-│   ├── events.jsonl    # 只追加的事件流，采集期间编目员可随时逐行读取
-│   └── current.json    # 每卷唯一一个当前条目（原子替换）
+│   ├── events.jsonl        # 只追加的事件流，采集期间编目员可随时逐行读取
+│   ├── current.json        # 每卷唯一一个当前条目（原子替换）
+│   └── diagnostics.jsonl   # 只追加的续采诊断流（每次逻辑请求 start/done，每行 fsync）
 ├── images/<卷宗号>/
 │   ├── v<n>_<校验前缀>.img   # 校验通过的完整影像（不可变，旧版保留）
 │   └── chunks/...            # 下载中的持久化区段（装配后清理）
@@ -118,7 +121,42 @@ data/
 退出码：`0` 全部完成；`2` 仍有卷宗待补齐（状态已落盘，再跑一次即可续）；
 `73` 工作目录被其他进程占用。
 
-## 五、一条命令完成端到端验证（80 秒内）
+## 五、续采诊断（值班员只读查询，持锁可查）
+
+```bash
+python3 -m aerial --workdir ./data diagnose                 # 全量文本报告
+python3 -m aerial --workdir ./data diagnose --volume V0008  # 只看单卷
+python3 -m aerial --workdir ./data diagnose --volume V0006 --version 1
+python3 -m aerial --workdir ./data diagnose --run 2 --json  # 机器可读
+```
+
+诊断命令**不发起任何网络请求、不获取写锁、不创建目录**，采集进程持有
+`flock` 写锁期间也能并行查询。数据来源仅限三份清单产物：
+
+- `manifest/current.json`、`events.jsonl`、`diagnostics.jsonl`；
+- 对诊断流中**登记过的**区段/影像路径做一次 `stat` 取元数据——
+  **不打开影像内容、不 rglob 扫描 images 目录、不读 logs/run.log**，
+  因此单卷查询的开销与全量卷宗数无关。
+
+`diagnostics.jsonl` 在采集侧逐行 fsync 追加，记录四类逻辑请求
+（`catalog` / `detail` / `probe` / `chunk`）的 `start` 与 `done`，
+`done` 含底层 HTTP 尝试明细（被重试的 503/500 也留痕）。报告口径：
+
+| 维度 | 取值与含义 |
+|---|---|
+| 每次分段请求 | 逐行区分 `served`（实际发请求且落盘）、`reused`（未发请求，复用本地区段）、`failed`、`unknown` |
+| 强杀在途 | 有 `start` 无 `done` 一律标 **未知**，绝不臆测；再按登记路径 stat 给出“区段实际存在 / 无落盘证据”旁证 |
+| 落盘核对 | `chunk_present`（区段在盘且长度相符）、`assembled_committed`（已装配提交、区段目录已清理但完整影像在）、`chunk_missing`、`unexpected_present`（失败登记却有有效区段） |
+| 首次发布轮次 | 取自事件流中该版本首个 `download_succeeded`/`replaced` 事件的 `run_seq + round`（主扫描=0，补齐轮=1..N），复用与换版都不会覆盖 |
+| 版本归属 | `current`（当前条目）/ `superseded`（曾发布后被更新版替换，旧版影像保留）/ `unpublished`（从未进入当前清单） |
+| 运行状态 | `running`（进程存活且持锁）/ `finished`（有 run_end）/ `crashed`（无 run_end 且进程已退出，疑似强杀） |
+| 一致性核对 | 事件流提交记录与 current.json 的版本、校验值、影像路径逐项比对，不一致时退出码为 `4` |
+
+**强杀后的状态保证**：未获确证的请求永久保留“未知”结论，续采重拉只新增
+新运行序号的记录行，不会改写历史；同址换版（下载地址沿用）或整卷复用时，
+旧版的归属与首次发布轮次仍可在报告中按版本分行查到。
+
+## 六、一条命令完成端到端验证（80 秒内）
 
 ```bash
 python3 verify.py
@@ -132,10 +170,12 @@ python3 verify.py
 python3 verify.py --workdir ./verify_data --keep
 ```
 
-验证脚本内部会：全量下载中 `SIGKILL` 强杀 → 同目录续采并断言“复用 N 段” →
-等到补登条目与换版生效后跑增量 → 对所有当前影像重新计算 sha256 比对。
+验证脚本内部会：全量下载中 `SIGKILL` 强杀 → 强杀后立即只读诊断并断言
+“未知请求 + 落盘旁证” → 同目录续采并断言“复用 N 段” → 持锁并行诊断 →
+等到补登条目与换版生效后跑增量 → 对所有当前影像重新计算 sha256 比对，
+并核对同址换版后旧版归属与首次发布轮次仍可查。
 
-## 六、运行单元测试
+## 七、运行单元测试
 
 ```bash
 python3 -m unittest discover -s tests -v

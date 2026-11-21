@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -21,6 +22,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .config import Config
+from .diagnose import (
+    KIND_CATALOG, KIND_DETAIL, DiagnosticsStore, RequestTracker,
+    RESULT_FAILED, RESULT_SERVED,
+)
 from .downloader import ImageDownloader
 from .http import Client, PermanentHTTPError, TransientHTTPError
 from .limiter import RateLimiter
@@ -40,6 +45,7 @@ class Job:
     href: str
     updated_at: Optional[int]
     attempts: int = 0
+    round_no: int = 0
 
 
 class Scanner:
@@ -52,7 +58,17 @@ class Scanner:
         self.limiter = RateLimiter(cfg.min_interval)
         self.client = Client(cfg, self.limiter)
         self.manifest = Manifest(workdir.events_file, workdir.current_file)
-        self.downloader = ImageDownloader(cfg, self.client, self.manifest)
+        # 诊断记录与 events.jsonl / current.json 同目录：只追加、每行 fsync。
+        # 值班员查询时不取写锁，采集持锁期间也能并行读。
+        self.diagnostics = DiagnosticsStore(workdir.diagnostics_file)
+        self.run_seq = self.diagnostics.next_run_seq(self.mode)
+        self.tracker = RequestTracker(self.diagnostics, run_seq=self.run_seq)
+        self.manifest.run_seq = self.run_seq
+        # 底层 HTTP 尝试（含被重试的 503/500）实时落诊断记录
+        self.client.attempt_hook = self.tracker.note_attempt
+        self.downloader = ImageDownloader(
+            cfg, self.client, self.manifest, tracker=self.tracker,
+        )
         self.state = ScanState.load(workdir.state_file)
         self.failed = FailedQueue(workdir.failed_file)
 
@@ -70,11 +86,17 @@ class Scanner:
         self._empty_seen_site_time: Optional[int] = None
         # 最近一次目录复查时的站点时间，用于限定补登等待上限
         self._last_recheck_site_time: Optional[int] = None
+        # 当前目录翻页所处轮次：主扫描 0，补齐轮次 1..N
+        self._current_round = 0
 
     # ------------------------------------------------------------------ #
     def run(self) -> int:
         log.info("==== 开始 %s 采集，工作目录 %s ====", self.mode, self.cfg.workdir)
-        # 上次未补齐的卷宗先入队
+        self.diagnostics.append({
+            "type": "run", "run_seq": self.run_seq, "mode": self.mode,
+            "pid": os.getpid(), "site_time": self.max_site_time,
+        })
+        # 上次未补齐的卷宗先入队（主扫描轮次）
         for item in self.failed.all():
             self._enqueue(Job(item.volume_id, item.href or f"/volumes/{item.volume_id}",
                               item.updated_at, item.attempts))
@@ -95,7 +117,7 @@ class Scanner:
             if self.stop_event.is_set():
                 break
             time.sleep(self.cfg.retry_round_interval)
-            found_new = self._recheck_catalog(horizon)
+            found_new = self._recheck_catalog(horizon, round_no)
             pending = self.failed.all()
             if not pending and not self._should_keep_waiting():
                 log.info("补齐轮次 %d：无待办且补登窗口已走完，结束", round_no)
@@ -108,7 +130,8 @@ class Scanner:
                 for item in pending:
                     self._enqueue(Job(item.volume_id,
                                       item.href or f"/volumes/{item.volume_id}",
-                                      item.updated_at, item.attempts))
+                                      item.updated_at, item.attempts,
+                                      round_no=round_no))
                 self.jobs.join()
 
         # 保存扫描水位：用“扫描启动时刻”而非结束时刻，保证扫描期间生效、
@@ -122,6 +145,11 @@ class Scanner:
         log.info("==== %s 采集结束：清单 %d 卷，待补齐 %d 卷，限流统计 %s ====",
                  self.mode, self.manifest.volume_count(), remaining,
                  self.limiter.snapshot())
+        self.diagnostics.append({
+            "type": "run_end", "run_seq": self.run_seq,
+            "reason": "completed", "remaining_failed": remaining,
+            "site_time": self.max_site_time,
+        })
         return 0 if remaining == 0 else 2
 
     # ------------------------------------------------------------------ #
@@ -160,12 +188,14 @@ class Scanner:
             return
 
         self.state.known_volumes.add(vid)
+        self.manifest.round_no = job.round_no
         self.manifest.record_discovered(detail)
 
         try:
-            self.downloader.download(detail)
+            self.downloader.download(detail, round_no=job.round_no)
         except TransientHTTPError as exc:
             self._mark_failed(job, f"影像下载临时故障: {exc}", detail=detail)
+            self.manifest.round_no = job.round_no
             self.manifest.record_failure(vid, detail, str(exc))
             return
         except PermanentHTTPError as exc:
@@ -175,8 +205,23 @@ class Scanner:
         self.failed.remove(vid)
 
     def _fetch_detail(self, job: Job) -> VolumeDetail:
-        resp = self.client.get(job.href)
+        req_id = self.tracker.begin(
+            kind=KIND_DETAIL, target=job.href, round_no=job.round_no,
+            volume_id=job.volume_id, updated_at=job.updated_at,
+        )
+        try:
+            resp = self.client.get(job.href, req_id=req_id)
+        except (PermanentHTTPError, TransientHTTPError) as exc:
+            self.tracker.end(
+                req_id, RESULT_FAILED, volume_id=job.volume_id,
+                updated_at=job.updated_at, error=str(exc),
+            )
+            raise
         self._note_site_time(resp.site_time)
+        self.tracker.end(
+            req_id, RESULT_SERVED, site_time=resp.site_time,
+            volume_id=job.volume_id, updated_at=job.updated_at,
+        )
         return parse_detail(resp.data.decode("utf-8"))
 
     # ------------------------------------------------------------------ #
@@ -185,9 +230,14 @@ class Scanner:
         url: Optional[str] = "/catalog"
         page_no = 0
         horizon: Optional[int] = None
+        self._current_round = 0
         while url is not None and not self.stop_event.is_set():
             page_no += 1
-            resp = self.client.get(url)
+            req_id = self.tracker.begin(
+                kind=KIND_CATALOG, target=url, round_no=0,
+            )
+            resp = self.client.get(url, req_id=req_id)
+            self.tracker.end(req_id, RESULT_SERVED, site_time=resp.site_time)
             self._note_site_time(resp.site_time)
             page = parse_catalog(resp.data.decode("utf-8"))
 
@@ -226,7 +276,7 @@ class Scanner:
         horizon_now = self._last_recheck_site_time - self.cfg.backfill_seconds
         return horizon_now <= self._empty_seen_site_time
 
-    def _recheck_catalog(self, horizon: Optional[int]) -> bool:
+    def _recheck_catalog(self, horizon: Optional[int], round_no: int) -> bool:
         """补齐轮次中完整重翻目录，捞取晚补登 / 换版的条目。
 
         不能只看首页：补登条目可能出现在后续分页。返回是否发现新候选。
@@ -234,10 +284,15 @@ class Scanner:
         before = len({k[0] for k in self._seen_catalog})
         url: Optional[str] = "/catalog"
         page_no = 0
+        self._current_round = round_no
         try:
             while url is not None:
                 page_no += 1
-                resp = self.client.get(url)
+                req_id = self.tracker.begin(
+                    kind=KIND_CATALOG, target=url, round_no=round_no,
+                )
+                resp = self.client.get(url, req_id=req_id)
+                self.tracker.end(req_id, RESULT_SERVED, site_time=resp.site_time)
                 self._note_site_time(resp.site_time)
                 self._last_recheck_site_time = resp.site_time
                 if horizon is None and self.mode == "incremental":
@@ -274,7 +329,8 @@ class Scanner:
                      vid, entry.updated_at, entry.href)
             return
         self._seen_catalog.add(dedup_key)
-        self._enqueue(Job(vid, entry.href, entry.updated_at))
+        self._enqueue(Job(vid, entry.href, entry.updated_at,
+                          round_no=self._current_round))
 
     def _current_horizon(self, site_time: Optional[int]) -> Optional[int]:
         if site_time is None:

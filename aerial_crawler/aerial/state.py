@@ -140,6 +140,7 @@ class WorkDir:
         self.failed_file = self.state_dir / "failed.json"
         self.events_file = self.manifest_dir / "events.jsonl"
         self.current_file = self.manifest_dir / "current.json"
+        self.diagnostics_file = self.manifest_dir / "diagnostics.jsonl"
         self.lock_file = self.state_dir / "lock"
         self._lock_fh = None
 

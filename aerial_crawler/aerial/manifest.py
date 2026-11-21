@@ -38,9 +38,16 @@ class Manifest:
             self._current = json.loads(current_file.read_text(encoding="utf-8"))
         if not events_file.exists():
             events_file.touch()
+        # 由 scanner 在每次提交前设置：本次运行序号与补齐轮次，
+        # 写入事件后，诊断侧可回答“该版首次进入当前清单的轮次”。
+        self.run_seq: Optional[int] = None
+        self.round_no: int = 0
 
     # ------------------------------------------------------------------ #
     def _append_event(self, event: dict) -> None:
+        if self.run_seq is not None:
+            event.setdefault("run_seq", self.run_seq)
+            event.setdefault("round", self.round_no)
         line = json.dumps(event, ensure_ascii=False, sort_keys=True)
         with open(self.events_file, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")

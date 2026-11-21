@@ -121,6 +121,30 @@ def load_current(workdir: Path) -> dict:
     return json.loads((workdir / "manifest" / "current.json").read_text("utf-8"))
 
 
+def diagnose(workdir: Path, *extra: str) -> dict:
+    """以只读子进程运行诊断，返回 JSON 报告（不获取写锁）。"""
+    cmd = [PYTHON, "-m", "aerial", "--workdir", str(workdir),
+           "diagnose", "--json", *extra]
+    out = subprocess.run(cmd, cwd=ROOT, check=True,
+                         stdout=subprocess.PIPE, text=True)
+    return json.loads(out.stdout)
+
+
+def _all_requests(report: dict) -> list[dict]:
+    out = []
+    for v in report["volumes"].values():
+        for ver in v["versions"]:
+            out.extend(ver["requests"])
+    return out
+
+
+def _version_view(report: dict, vid: str, version: int) -> dict:
+    for ver in report["volumes"][vid]["versions"]:
+        if ver["version"] == version:
+            return ver
+    raise AssertionError(f"报告缺少 {vid} v{version}")
+
+
 def verify_all_images(workdir: Path, check: Check, expect_count: int) -> None:
     cur = load_current(workdir)
     check.expect(f"当前条目数为 {expect_count}", len(cur) == expect_count,
@@ -192,6 +216,33 @@ def main() -> int:
         check.expect("采集进程被 SIGKILL 强杀", p.returncode == -signal.SIGKILL,
                      f"returncode={p.returncode}")
 
+        # ---- 阶段 1.5：强杀后立即只读诊断（不持有写锁） ----
+        print("阶段 1.5：强杀后运行只读续采诊断")
+        report_killed = diagnose(wd)
+        run1 = next((r for r in report_killed["runs"] if r["run_seq"] == 1), None)
+        check.expect("诊断把无 run_end 且进程已退出的运行标为异常终止",
+                     run1 is not None and run1["status"] == "crashed",
+                     f"runs={[(r['run_seq'], r['status']) for r in report_killed['runs']]}")
+        check.expect("强杀在途的分段请求未获确证，一律标“未知”",
+                     report_killed["inflight_unknown"] >= 1,
+                     f"未知请求 {report_killed['inflight_unknown']} 条")
+        killed_reqs = _all_requests(report_killed)
+        unknowns = [q for q in killed_reqs if q["state"] == "unknown"]
+        check.expect("未知请求只可能来自分段/详情/探测，且每条均有磁盘旁证结论",
+                     all(q["kind"] in ("chunk", "detail", "probe")
+                         and q["disk_state"] in
+                         ("chunk_present", "no_evidence", None) for q in unknowns),
+                     f"{len(unknowns)} 条未知")
+        # 已 fsync 的区段：诊断只 stat 登记路径即可确认落盘（不打开影像）
+        served_present = [q for q in killed_reqs
+                          if q["state"] == "served"
+                          and q["disk_state"] == "chunk_present"]
+        check.expect("已确证请求的落盘区段可被 stat 旁证（不读影像、不扫全量日志）",
+                     bool(served_present), f"{len(served_present)} 段在盘")
+        check.expect("诊断报告不触碰锁文件之外的写路径（lock 仍指向被强杀 PID）",
+                     report_killed["lock"]["held"] is False
+                     and report_killed["lock"]["pid"] == p.pid)
+
         # ---- 阶段 2：等到补登条目出现后，用同一工作目录续采 ----
         # （区段复用立即发生；补登条目此时已在目录，主扫描即可发现，
         #  即使尚未出现，补齐轮次也会按地平线持续复查）
@@ -210,10 +261,45 @@ def main() -> int:
         check.expect("补登卷宗 V0007 经补齐轮次入库", "V0007" in load_current(wd))
         verify_all_images(wd, check, expect_count=8)
 
+        # 续采后的诊断：崩溃/正常运行并存，复用行与首次发布轮次可查
+        report_resume = diagnose(wd)
+        statuses = {r["run_seq"]: r["status"] for r in report_resume["runs"]}
+        check.expect("诊断区分强杀运行与续采运行（crashed + finished）",
+                     statuses.get(1) == "crashed" and statuses.get(2) == "finished",
+                     str(statuses))
+        reused_rows = [q for q in _all_requests(report_resume)
+                       if q["state"] == "reused"]
+        check.expect("续采复用的区段在报告中单独标“复用”，与新拉请求区分",
+                     bool(reused_rows), f"{len(reused_rows)} 条复用记录")
+        v8 = _version_view(report_resume, "V0008", 1)
+        check.expect("报告给出该版首次进入当前清单的运行与轮次",
+                     v8["first_publish"] is not None
+                     and v8["first_publish"]["run_seq"] == 2
+                     and v8["first_publish"]["round"] == 0,
+                     str(v8["first_publish"]))
+        check.expect("强杀时的未知请求在续采后仍保留“未知”结论（不被重写）",
+                     any(q["state"] == "unknown" for q in _all_requests(report_resume)))
+        check.expect("落盘与发布一致性核对全部通过",
+                     all(c["ok"] for c in report_resume["consistency"]),
+                     "; ".join(c["detail"] for c in report_resume["consistency"]
+                               if not c["ok"]))
+
         # ---- 阶段 3：等换版生效后跑增量 ----
         print("阶段 2：等待站点时钟越过换版时间点，执行增量采集")
         _wait_site_time(base_url, V6_V2_AT + 5)
         p3 = crawl(base_url, wd, "incremental", log_path)
+        # 增量采集持有写锁期间并行查询：诊断不取锁，必须立刻成功
+        locked_report = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and p3.poll() is None:
+            try:
+                locked_report = diagnose(wd, "--volume", "V0006")
+                break
+            except subprocess.CalledProcessError:
+                time.sleep(0.2)
+        check.expect("采集持有写锁时诊断查询照常返回（不抢锁、不读影像）",
+                     locked_report is not None
+                     and locked_report["lock"]["held"] is True)
         try:
             p3.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -226,6 +312,33 @@ def main() -> int:
         cur = load_current(wd)
         events = [json.loads(x) for x in
                   (wd / "manifest" / "events.jsonl").read_text().splitlines()]
+
+        # 换版后的诊断：同址换版，旧版归属与首次发布轮次仍可查
+        report_final = diagnose(wd)
+        v6_views = {x["version"]: x
+                    for x in report_final["volumes"]["V0006"]["versions"]}
+        check.expect("换版后当前条目为 v2，旧版 v1 仍在报告中保留归属",
+                     v6_views[2]["publish_state"] == "current"
+                     and v6_views[1]["publish_state"] == "superseded")
+        check.expect("旧版 v1 的首次发布轮次不被换版覆盖（仍指向 run 2 主扫描）",
+                     v6_views[1]["first_publish"] is not None
+                     and v6_views[1]["first_publish"]["run_seq"] == 2,
+                     str(v6_views[1]["first_publish"]))
+        check.expect("v2 首次进入当前清单记录为增量运行的发布事件",
+                     v6_views[2]["first_publish"] is not None
+                     and v6_views[2]["first_publish"]["run_seq"] == 3
+                     and v6_views[2]["first_publish"]["event"] == "replaced",
+                     str(v6_views[2]["first_publish"]))
+        check.expect("新旧版本影像地址相同（同址换版），报告按版本分行",
+                     len({x.get("image_target") for x in v6_views.values()
+                          if x.get("image_target")}) == 1
+                     and "/images/V0006" in (v6_views[2].get("image_target") or ""))
+        check.expect("每次分段请求逐行可查，结果只含 已落盘/复用/失败/未知 四类",
+                     {q["state"] for q in _all_requests(report_final)}
+                     <= {"served", "reused", "failed", "unknown"})
+        check.expect("最终一致性核对全部通过、current.json 结构完好",
+                     all(c["ok"] for c in report_final["consistency"])
+                     and not report_final["current_json_broken"])
 
         print("\n---- 场景断言 ----")
         print("[补登]")

@@ -53,6 +53,21 @@ class Client:
         self._port = parts.port or (443 if parts.scheme == "https" else 80)
         self._prefix = parts.path.rstrip("/")
         self.retries = 0
+        # 每次底层尝试（含被重试的 5xx/503）后的诊断回调，签名：
+        # (req_id, target, attempt_no, status|None, error|None, site_time|None)
+        # req_id 由调用方显式传入，避免多线程下线程本地变量串台；
+        # 未传时为 None（无诊断上下文的普通调用）。
+        self.attempt_hook = None
+
+    def _notify_attempt(self, target: str, attempt: int,
+                        status: Optional[int], error: Optional[str],
+                        site_time: Optional[int] = None,
+                        req_id: Optional[str] = None) -> None:
+        if self.attempt_hook is not None:
+            try:
+                self.attempt_hook(req_id, target, attempt, status, error, site_time)
+            except Exception:  # noqa: BLE001 - 诊断不能影响采集主流程
+                log.debug("诊断尝试回调异常", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 内部原语
@@ -106,7 +121,8 @@ class Client:
             url=target,
         )
 
-    def get(self, url: str, *, extra_headers: Optional[dict[str, str]] = None) -> Response:
+    def get(self, url: str, *, extra_headers: Optional[dict[str, str]] = None,
+            req_id: Optional[str] = None) -> Response:
         """带限流、退避重试、503 统一暂停的 GET。
 
         - 2xx 直接返回；
@@ -130,6 +146,7 @@ class Client:
             try:
                 resp = self._one_request(target, headers)
             except (OSError, http.client.HTTPException) as exc:
+                self._notify_attempt(target, attempt + 1, None, f"{type(exc).__name__}: {exc}", req_id=req_id)
                 if attempt >= self.cfg.max_retries:
                     raise TransientHTTPError(f"连接失败且重试耗尽: {target}: {exc}") from exc
                 self._sleep_backoff(attempt, f"连接异常 {exc}")
@@ -137,6 +154,8 @@ class Client:
                 continue
 
             if resp.status in (503, 429):
+                self._notify_attempt(target, attempt + 1, resp.status, None,
+                                     resp.site_time, req_id=req_id)
                 if attempt >= self.cfg.max_retries:
                     raise TransientHTTPError(f"{resp.status} 且重试耗尽: {target}")
                 retry_after = self._parse_retry_after(resp.headers.get("retry-after"))
@@ -147,6 +166,8 @@ class Client:
                 continue
 
             if 500 <= resp.status < 600:
+                self._notify_attempt(target, attempt + 1, resp.status, None,
+                                     resp.site_time, req_id=req_id)
                 if attempt >= self.cfg.max_retries:
                     raise TransientHTTPError(f"HTTP {resp.status} 且重试耗尽: {target}")
                 self._sleep_backoff(attempt, f"HTTP {resp.status}")
@@ -155,8 +176,12 @@ class Client:
                 continue
 
             if resp.status >= 400:
+                self._notify_attempt(target, attempt + 1, resp.status, None,
+                                     resp.site_time, req_id=req_id)
                 raise PermanentHTTPError(resp.status, target)
 
+            self._notify_attempt(target, attempt + 1, resp.status, None,
+                                 resp.site_time, req_id=req_id)
             return resp
 
     def _sleep_backoff(self, attempt: int, reason: str) -> None:
@@ -184,17 +209,18 @@ class Client:
     # ------------------------------------------------------------------ #
     # 分段读取
     # ------------------------------------------------------------------ #
-    def get_range(self, url: str, start: int, end_inclusive: int) -> Response:
+    def get_range(self, url: str, start: int, end_inclusive: int,
+                  req_id: Optional[str] = None) -> Response:
         """读取闭区间 [start, end_inclusive] 的字节。
 
         服务端正常返回 206；若忽略 Range 返回 200，调用方按完整响应自行处理。
         """
         headers = {"Range": f"bytes={start}-{end_inclusive}"}
-        return self.get(url, extra_headers=headers)
+        return self.get(url, extra_headers=headers, req_id=req_id)
 
-    def head_size(self, url: str) -> int:
+    def head_size(self, url: str, req_id: Optional[str] = None) -> int:
         """通过一次 Range 请求探测影像总长度（Content-Range: bytes */total）。"""
-        resp = self.get_range(url, 0, 0)
+        resp = self.get_range(url, 0, 0, req_id=req_id)
         if resp.status == 206 and "content-range" in resp.headers:
             total = resp.headers["content-range"].split("/")[-1]
             if total.isdigit():
